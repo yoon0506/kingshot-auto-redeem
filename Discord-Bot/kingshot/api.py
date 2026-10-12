@@ -1,29 +1,24 @@
+"""DMD / Kingshot API bridge.
+
+Codes are discovered via the configured public code feed; redemption uses the
+Century Games gift-code endpoint and requires both UID (fid) and kingdom (kid).
+Only use for players who have opted in to gift redemption.
+"""
 import asyncio
+import hashlib
 import json
 import logging
-import random
+import os
+import time
 from typing import Any
-
 import aiohttp
 
-
 logger = logging.getLogger("kingshot-bot.api")
-
-
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "keep-alive",
-    "Referer": "https://kingshot.net/",
-    "Origin": "https://kingshot.net",
-}
-
+OFFICIAL_REDEEM_URL = "https://kingshot-giftcode.centurygame.com/api/gift_code"
+OFFICIAL_ORIGIN = "https://kingshot-giftcode.centurygame.com"
+# Public client signature value from the open-source reference implementation.
+# It is not a Discord credential; if the operator changes this protocol, update it.
+SIGNATURE_SUFFIX = "mN4!pQs6JrYwV9"
 
 class KingshotApi:
     def __init__(self, base_url: str, max_retries: int = 3, backoff_base: float = 2.0) -> None:
@@ -34,8 +29,7 @@ class KingshotApi:
 
     async def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=45)
-            self._session = aiohttp.ClientSession(headers=DEFAULT_HEADERS, timeout=timeout)
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=35))
         return self._session
 
     async def close(self) -> None:
@@ -43,154 +37,82 @@ class KingshotApi:
             await self._session.close()
 
     async def fetch_player_info(self, player_id: str) -> dict[str, Any] | None:
-        data = await self._request_json("GET", "/player-info", params={"playerId": player_id})
-        if data and data.get("status") == "success":
-            return data.get("data")
+        # Intentionally not used. That third-party API was removed.
         return None
 
     async def fetch_active_gift_codes(self) -> list[str]:
-        data = await self._request_json("GET", "/gift-codes")
-        if not data or data.get("status") != "success":
+        # Discovery feed is separate from the official redemption API.
+        # If unavailable, do not treat this as proof there are no codes.
+        url = self.base_url + "/gift-codes"
+        try:
+            session = await self.session()
+            async with session.get(url, headers={"Accept": "application/json"}) as response:
+                if response.status != 200:
+                    logger.warning("Code discovery returned HTTP %s", response.status)
+                    return []
+                data = await response.json(content_type=None)
+                if not isinstance(data, dict) or data.get("status") != "success":
+                    logger.warning("Code discovery returned an unsuccessful response")
+                    return []
+                return self._extract_codes(data.get("data", []))
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            logger.warning("Code discovery request failed: %s", type(exc).__name__)
             return []
-        return self._extract_codes(data.get("data", []))
 
     async def redeem_gift_code(self, player_id: str, gift_code: str) -> dict[str, Any]:
-        data = await self._request_json(
-            "POST",
-            "/gift-codes/redeem",
-            json={"playerId": str(player_id), "giftCode": gift_code},
-            retry_client_errors=False,
-        )
-        if not data:
-            return {
-                "success": False,
-                "already": False,
-                "rate_limited": False,
-                "expired": False,
-                "max_uses_reached": False,
-                "message": "Invalid response",
-                "raw": {},
-            }
+        kingdom = str(os.getenv("DMD_KINGDOM", "1850"))
+        if not player_id.isdigit() or not kingdom.isdigit():
+            return self._failure("Invalid UID or kingdom")
+        values = {"fid": str(player_id), "cdk": str(gift_code), "kid": kingdom, "time": str(int(time.time()))}
+        raw = "&".join(f"{key}={values[key]}" for key in sorted(values))
+        signature = hashlib.md5((raw + SIGNATURE_SUFFIX).encode("utf-8")).hexdigest()
+        payload = {"sign": signature, **values}
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": OFFICIAL_ORIGIN,
+            "Referer": OFFICIAL_ORIGIN + "/",
+        }
+        try:
+            session = await self.session()
+            async with session.post(OFFICIAL_REDEEM_URL, data=payload, headers=headers) as response:
+                if response.status == 429:
+                    return self._failure("HTTP 429 rate limited", rate_limited=True)
+                if response.status >= 500:
+                    logger.warning("Official redeem API HTTP %s", response.status)
+                    return self._failure(f"HTTP {response.status}")
+                try:
+                    result = await response.json(content_type=None)
+                except (ValueError, aiohttp.ContentTypeError):
+                    logger.warning("Official redeem API returned non-JSON HTTP %s", response.status)
+                    return self._failure(f"Non-JSON HTTP {response.status}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning("Official redeem request failed: %s", type(exc).__name__)
+            return self._failure(type(exc).__name__)
 
-        if data.get("status") == "success":
-            return {
-                "success": True,
-                "already": False,
-                "rate_limited": False,
-                "expired": False,
-                "max_uses_reached": False,
-                "message": data.get("message", ""),
-                "raw": data,
-            }
-
-        error_key = ""
-        meta = data.get("meta")
-        if isinstance(meta, dict):
-            error_key = str(meta.get("errorKey") or "")
-        message = data.get("message") or error_key or "Redeem failed"
-
+        if not isinstance(result, dict):
+            return self._failure("Invalid JSON response")
+        msg = str(result.get("msg") or result.get("message") or "Unknown response").strip().rstrip(".")
+        err = str(result.get("err_code") or "")
+        success = msg in {"SUCCESS", "SAME TYPE EXCHANGE"}
+        already = msg == "RECEIVED" and err == "40008"
+        rate_limited = msg == "TOO FREQUENT" or err == "40019"
+        expired = msg in {"TIME ERROR", "CDK NOT FOUND"}
+        max_uses = msg == "USED"
+        if msg == "USER INFO ERROR" or err == "40020":
+            msg = "Wrong kingdom or invalid UID for K1850 (USER INFO ERROR)"
         return {
-            "success": False,
-            "already": error_key == "GIFT_CODE_ALREADY_REDEEMED",
-            "rate_limited": self._is_rate_limited_response(data),
-            "expired": self._is_expired_response(data),
-            "max_uses_reached": self._is_max_uses_response(data),
-            "message": message,
-            "raw": data,
+            "success": success, "already": already,
+            "rate_limited": rate_limited, "expired": expired,
+            "max_uses_reached": max_uses, "message": msg,
+            # Avoid printing request signatures in logs.
+            "raw": {"msg": str(result.get("msg", "")), "err_code": err},
         }
 
-    async def _request_json(self, method: str, endpoint: str, retry_client_errors: bool = True, **kwargs) -> Any | None:
-        url = f"{self.base_url}{endpoint}"
-        for attempt in range(self.max_retries):
-            try:
-                session = await self.session()
-                async with session.request(method, url, **kwargs) as response:
-                    if response.status < 500 and (retry_client_errors or response.status < 400):
-                        return await self._read_json_response(response, method, endpoint)
-                    if response.status < 500:
-                        return await self._read_json_response(response, method, endpoint)
-                    body = await response.text()
-                    logger.warning(
-                        "%s %s failed with HTTP %s: %s",
-                        method,
-                        endpoint,
-                        response.status,
-                        body[:500],
-                    )
-                    if "status code 429" in body or response.status == 429:
-                        try:
-                            return json.loads(body)
-                        except ValueError:
-                            return {
-                                "status": "error",
-                                "message": "Rate limited by Kingshot",
-                                "meta": {"errorKey": "RATE_LIMITED"},
-                            }
-                    response.raise_for_status()
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-                logger.warning(
-                    "%s %s failed on attempt %s with %s: %s",
-                    method,
-                    endpoint,
-                    attempt + 1,
-                    type(exc).__name__,
-                    exc,
-                )
-
-            if attempt < self.max_retries - 1:
-                await self._sleep_backoff(attempt)
-
-        return None
-
-    async def _read_json_response(self, response: aiohttp.ClientResponse, method: str, endpoint: str) -> Any | None:
-        try:
-            return await response.json(content_type=None)
-        except ValueError:
-            body = await response.text()
-            logger.warning(
-                "%s %s returned non-JSON HTTP %s: %s",
-                method,
-                endpoint,
-                response.status,
-                body[:500],
-            )
-            return None
-
-    async def _sleep_backoff(self, attempt: int) -> None:
-        delay = min((self.backoff_base**attempt) + random.uniform(0, 1), 60)
-        await asyncio.sleep(delay)
-
     @staticmethod
-    def _is_rate_limited_response(data: dict[str, Any]) -> bool:
-        message = str(data.get("message") or "").lower()
-        meta = data.get("meta")
-        error_key = ""
-        if isinstance(meta, dict):
-            error_key = str(meta.get("errorKey") or meta.get("code") or "").lower()
-        return "429" in message or "rate limit" in message or error_key == "rate_limited"
-
-    @staticmethod
-    def _is_expired_response(data: dict[str, Any]) -> bool:
-        message = str(data.get("message") or "").lower()
-        meta = data.get("meta")
-        error_key = ""
-        if isinstance(meta, dict):
-            error_key = str(meta.get("errorKey") or meta.get("code") or "").lower()
-        return "expired" in message or "expired" in error_key
-
-    @staticmethod
-    def _is_max_uses_response(data: dict[str, Any]) -> bool:
-        message = str(data.get("message") or "").lower()
-        meta = data.get("meta")
-        error_key = ""
-        if isinstance(meta, dict):
-            error_key = str(meta.get("errorKey") or meta.get("code") or "").lower()
-        return (
-            "maximum uses" in message
-            or "max uses" in message
-            or "maximum use" in message
-            or "max_uses" in error_key
-        )
+    def _failure(message: str, rate_limited: bool = False) -> dict[str, Any]:
+        return {"success": False, "already": False, "rate_limited": rate_limited,
+                "expired": False, "max_uses_reached": False, "message": message, "raw": {}}
 
     @staticmethod
     def _extract_codes(data: Any) -> list[str]:
@@ -198,7 +120,6 @@ class KingshotApi:
             data = data.get("giftCodes") or data.get("codes") or data.get("activeCodes") or []
         if not isinstance(data, list):
             return []
-
         codes = []
         for item in data:
             if isinstance(item, str):
