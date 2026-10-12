@@ -28,6 +28,7 @@ from kingshot.config import load_config
 from kingshot.redeemer import AutoRedeemer
 
 from kingshot.repository import JsonRepository
+from kingshot.reporting import ReportStore
 
 from kingshot.ui import build_player_embed, build_player_embeds
 
@@ -136,6 +137,9 @@ class KingshotBot(discord.Client):
         )
 
         self.redeemer = AutoRedeemer(self.repository, self.api, CONFIG["auto_redeem"])
+        self.report_store = ReportStore(self.repository)
+        self.report_channel_id = _optional_int_env("DMD_REPORT_CHANNEL_ID")
+        self._report_lock = asyncio.Lock()
         self._form_sync_url = os.getenv("DMD_SYNC_URL", "").strip()
         self._form_sync_key = os.getenv("DMD_SYNC_KEY", "").strip()
 
@@ -163,11 +167,19 @@ class KingshotBot(discord.Client):
         else:
             logger.info("DMD form sync disabled: DMD_SYNC_URL or DMD_SYNC_KEY missing")
 
+        if self.report_channel_id:
+            self.report_loop.start()
+            logger.info("DMD redemption reports enabled (interval: 5 minutes)")
+        else:
+            logger.info("DMD redemption reports disabled: DMD_REPORT_CHANNEL_ID missing")
+
 
 
 
     async def close(self) -> None:
 
+        if self.report_loop.is_running():
+            self.report_loop.cancel()
         if self.form_sync_loop.is_running():
             self.form_sync_loop.cancel()
         if self.auto_redeem_loop.is_running():
@@ -272,6 +284,71 @@ class KingshotBot(discord.Client):
             "DMD form sync finished: added=%d existing=%d invalid=%d",
             added_count, existing_count, invalid_count,
         )
+
+    @tasks.loop(minutes=5)
+    async def report_loop(self) -> None:
+        await self.wait_until_ready()
+        for code in self.report_store.recent_codes():
+            await self.publish_redeem_report(code)
+
+    async def publish_redeem_report(self, code: str, *, force: bool = False) -> str:
+        """Maintain a single private-channel message per code across restarts."""
+        if not self.report_channel_id:
+            return "DMD_REPORT_CHANNEL_ID is not configured."
+        async with self._report_lock:
+            stats = await self.report_store.summary(code)
+            if stats['total'] == 0:
+                return "No registered players with auto-redeem enabled."
+            channel = self.get_channel(self.report_channel_id)
+            if channel is None:
+                try:
+                    channel = await self.fetch_channel(self.report_channel_id)
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
+                    logger.warning("Cannot access DMD report channel: %s", type(exc).__name__)
+                    return "Cannot access the configured report channel."
+            if not hasattr(channel, 'send') or not hasattr(channel, 'fetch_message'):
+                return "Report channel must be a text channel."
+            signature = "/".join(str(stats[key]) for key in (
+                'total', 'success', 'already', 'accepted_unknown', 'failed', 'pending'))
+            saved = self.report_store.load_messages()
+            key = f"{self.report_channel_id}:{code}"
+            record = saved.get(key, {})
+            if not force and record.get('signature') == signature:
+                return "Report unchanged."
+
+            finished = stats['total'] - stats['pending']
+            embed = discord.Embed(
+                title=f"🍅 DMD Gift Code — {code}",
+                description=f"왕국 1850 · 진행 {finished}/{stats['total']}명 · 5분마다 갱신",
+                color=discord.Color.green() if stats['pending'] == 0 and stats['failed'] == 0 else discord.Color.orange(),
+            )
+            embed.add_field(name="✅ 서버 성공 응답", value=str(stats['success']), inline=True)
+            embed.add_field(name="🔁 이미 수령", value=str(stats['already']), inline=True)
+            embed.add_field(name="❌ 실패 / 재시도 대상", value=str(stats['failed']), inline=True)
+            embed.add_field(name="⏳ 아직 성공 기록 없음", value=str(stats['pending']), inline=True)
+            if stats['accepted_unknown']:
+                embed.add_field(name="📋 성공 분류 불명", value=str(stats['accepted_unknown']), inline=True)
+            embed.set_footer(text="봇의 API 결과 기준 · 실제 게임 우편함 지급 여부는 별도 확인 필요")
+
+            message = None
+            if record.get('message_id'):
+                try:
+                    message = await channel.fetch_message(int(record['message_id']))
+                    await message.edit(embed=embed)
+                except discord.NotFound:
+                    message = None
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    logger.warning("Report update failed: %s", type(exc).__name__)
+                    return "Cannot edit existing report message."
+            if message is None:
+                try:
+                    message = await channel.send(embed=embed)
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    logger.warning("Report send failed: %s", type(exc).__name__)
+                    return "Cannot send to report channel."
+            saved[key] = {'message_id': message.id, 'signature': signature}
+            self.report_store.save_messages(saved)
+            return f"Report posted/updated for {code}."
 
     def wake_auto_redeem(self, reason: str) -> None:
 
@@ -612,6 +689,21 @@ async def redeem_code(interaction: discord.Interaction, code: str) -> None:
     )
 
 
+@bot.tree.command(name="redeemreport", description="DMD admins: publish or refresh one coupon progress report.")
+@app_commands.describe(code="Gift code to report, e.g. CHALLENGE26")
+async def redeem_report(interaction: discord.Interaction, code: str) -> None:
+    if not _is_admin(interaction.user.id):
+        await interaction.response.send_message("DMD admins only.", ephemeral=True)
+        return
+    code = code.strip()
+    if not (3 <= len(code) <= 64 and code.isascii() and code.isalnum()):
+        await interaction.response.send_message("Invalid gift code.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await bot.publish_redeem_report(code, force=True)
+    await interaction.followup.send(result, ephemeral=True)
+
+
 @bot.tree.command(name="list", description="List your registered Kingshot players.")
 
 @app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
@@ -814,6 +906,7 @@ async def status(interaction: discord.Interaction, player_id: str) -> None:
 
 @register.error
 @redeem_code.error
+@redeem_report.error
 @bulk_register.error
 @bulk_remove.error
 
