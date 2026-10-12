@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import logging
 
@@ -9,6 +10,7 @@ from pathlib import Path
 
 
 
+import aiohttp
 import discord
 
 from discord import app_commands
@@ -134,6 +136,9 @@ class KingshotBot(discord.Client):
         )
 
         self.redeemer = AutoRedeemer(self.repository, self.api, CONFIG["auto_redeem"])
+        self._form_sync_url = os.getenv("DMD_SYNC_URL", "").strip()
+        self._form_sync_key = os.getenv("DMD_SYNC_KEY", "").strip()
+
 
 
 
@@ -152,12 +157,21 @@ class KingshotBot(discord.Client):
             )
             self.auto_redeem_loop.start()
 
+        if self._form_sync_url and self._form_sync_key:
+            self.form_sync_loop.start()
+            logger.info("DMD form sync enabled (interval: 5 minutes)")
+        else:
+            logger.info("DMD form sync disabled: DMD_SYNC_URL or DMD_SYNC_KEY missing")
+
 
 
 
     async def close(self) -> None:
 
-        self.auto_redeem_loop.cancel()
+        if self.form_sync_loop.is_running():
+            self.form_sync_loop.cancel()
+        if self.auto_redeem_loop.is_running():
+            self.auto_redeem_loop.cancel()
 
         await self.api.close()
 
@@ -174,6 +188,90 @@ class KingshotBot(discord.Client):
         await self.redeemer.run_once()
 
 
+
+    @tasks.loop(minutes=5)
+    async def form_sync_loop(self) -> None:
+        await self.wait_until_ready()
+        await self.sync_form_players()
+
+    async def sync_form_players(self) -> None:
+        # Google Form sync uses one designated admin as the record owner.
+        # The form does not collect Discord user IDs, so self-service commands
+        # for these imported UIDs remain restricted to that admin.
+        admin_ids = CONFIG.get("admins", {}).get("user_ids", [])
+        owner_id = next((str(uid) for uid in admin_ids if str(uid).isdigit()), None)
+        if owner_id is None:
+            logger.error("Form sync skipped: set an admin Discord user ID in config.json")
+            return
+
+        if not (self._form_sync_url.startswith("https://script.google.com/macros/s/")
+                and self._form_sync_url.split("?", 1)[0].endswith("/exec")):
+            logger.error("Form sync skipped: invalid Google Apps Script /exec URL")
+            return
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=40)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    self._form_sync_url,
+                    json={"key": self._form_sync_key},
+                    allow_redirects=True,
+                ) as response:
+                    response.raise_for_status()
+                    body = await response.content.read(2_000_001)
+                    if len(body) > 2_000_000:
+                        raise ValueError("Form response too large")
+                    payload = json.loads(body.decode("utf-8"))
+        except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError, ValueError) as exc:
+            logger.warning("DMD form sync request failed: %s", type(exc).__name__)
+            return
+
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            logger.warning("DMD form sync rejected or returned invalid data")
+            return
+        players = payload.get("players")
+        if not isinstance(players, list) or len(players) > 5000:
+            logger.warning("DMD form sync returned an invalid player list")
+            return
+
+        ids = []
+        invalid_count = 0
+        for player in players:
+            if not isinstance(player, dict) or str(player.get("kingdom")) != "1850":
+                invalid_count += 1
+                continue
+            uid = str(player.get("uid", "")).strip()
+            if not (uid.isascii() and uid.isdecimal() and 5 <= len(uid) <= 15):
+                invalid_count += 1
+                continue
+            ids.append(uid)
+
+        ids = list(dict.fromkeys(ids))
+        if not ids:
+            logger.info("DMD form sync: no valid UIDs (invalid=%d)", invalid_count)
+            return
+
+        # Work in batches to avoid large write operations on the free host.
+        added_count = 0
+        existing_count = 0
+        try:
+            for start in range(0, len(ids), 50):
+                result = await self.repository.bulk_register(owner_id, ids[start:start+50], kingdom=1850)
+                added_count += len(result["added"])
+                existing_count += len(result["existing"])
+            if added_count:
+                await self.repository.log_event(
+                    "google_form_players_registered", added=added_count,
+                    existing=existing_count, invalid=invalid_count,
+                )
+                self.wake_auto_redeem(f"Google Form sync added {added_count} player(s)")
+        except Exception:
+            logger.exception("DMD form sync failed while saving players")
+            return
+        logger.info(
+            "DMD form sync finished: added=%d existing=%d invalid=%d",
+            added_count, existing_count, invalid_count,
+        )
 
     def wake_auto_redeem(self, reason: str) -> None:
 
