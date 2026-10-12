@@ -3,6 +3,7 @@ import asyncio
 import logging
 
 import os
+import re
 
 from pathlib import Path
 
@@ -397,6 +398,89 @@ async def register(interaction: discord.Interaction, player_id: str) -> None:
 
 
 
+def _parse_bulk_ids(raw: str) -> tuple[list[str], list[str], str | None]:
+    """Accept CSV, spaces or newlines; enforce reasonable input size and dedupe."""
+    if len(raw) > 1800:
+        return [], [], "Too much text. Submit at most 1,800 characters per command."
+    tokens = [item for item in re.split(r"[\s,;]+", raw.strip()) if item]
+    if not tokens:
+        return [], [], "Please provide at least one Kingshot UID."
+    if len(tokens) > 50:
+        return [], [], "Maximum 50 IDs per command. Split the list into batches."
+    unique = list(dict.fromkeys(tokens))
+    valid = [item for item in unique if item.isascii() and item.isdigit() and 5 <= len(item) <= 15]
+    invalid = [item for item in unique if item not in valid]
+    return valid, invalid, None
+
+
+def _compact_ids(ids: list[str]) -> str:
+    shown = ", ".join(ids[:10])
+    return f"{shown}{' …' if len(ids) > 10 else ''}" if ids else "—"
+
+
+@bot.tree.command(name="bulkregister", description="DMD admins: register up to 50 consenting 1850 UIDs.")
+@app_commands.describe(ids="Comma, space, or newline separated Kingshot player UIDs (up to 50)")
+@app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
+async def bulk_register(interaction: discord.Interaction, ids: str) -> None:
+    if not _is_admin(interaction.user.id):
+        await interaction.response.send_message("DMD admins only.", ephemeral=True)
+        return
+    valid, invalid, error = _parse_bulk_ids(ids)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    if not valid:
+        await interaction.response.send_message("No valid UIDs (5–15 digits) were provided.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await bot.repository.bulk_register(str(interaction.user.id), valid, kingdom=1850)
+    await bot.repository.log_event(
+        "bulk_players_registered", discordUserId=str(interaction.user.id),
+        added=result["added"], existing=result["existing"], invalid=invalid,
+    )
+    if result["added"]:
+        bot.wake_auto_redeem(f"admin bulk registered {len(result['added'])} player(s)")
+    await interaction.followup.send(
+        f"Kingdom 1850 — Added **{len(result['added'])}**, already registered **{len(result['existing'])}**, invalid **{len(invalid)}**.\n"
+        f"Added: {_compact_ids(result['added'])}\nAlready: {_compact_ids(result['existing'])}\nInvalid: {_compact_ids(invalid)}\n"
+        "UIDs are stored but not verified until an actual redeem response.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="bulkremove", description="DMD admins: remove up to 50 player UIDs, including other users' records.")
+@app_commands.describe(ids="Comma, space, or newline separated UIDs", confirm="Must be True to permanently remove accounts and redemption history")
+@app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
+async def bulk_remove(interaction: discord.Interaction, ids: str, confirm: bool = False) -> None:
+    if not _is_admin(interaction.user.id):
+        await interaction.response.send_message("DMD admins only.", ephemeral=True)
+        return
+    valid, invalid, error = _parse_bulk_ids(ids)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    if not valid:
+        await interaction.response.send_message("No valid UIDs were provided.", ephemeral=True)
+        return
+    if not confirm:
+        await interaction.response.send_message(
+            f"You entered **{len(valid)}** UID(s). To delete their registration AND redeem history, rerun with `confirm:True`. "
+            "Back up `Discord-Bot/data` first.", ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await bot.repository.bulk_remove(valid)
+    await bot.repository.log_event(
+        "bulk_players_removed", discordUserId=str(interaction.user.id),
+        removed=result["removed"], missing=result["missing"], invalid=invalid,
+    )
+    await interaction.followup.send(
+        f"Removed **{len(result['removed'])}**, not registered **{len(result['missing'])}**, invalid **{len(invalid)}**.\n"
+        f"Removed: {_compact_ids(result['removed'])}\nNot found: {_compact_ids(result['missing'])}",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="redeemcode", description="Admin only: queue a gift code for all registered players.")
 @app_commands.describe(code="Kingshot gift code, for example CHALLENGE26")
 @app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
@@ -634,6 +718,8 @@ async def status(interaction: discord.Interaction, player_id: str) -> None:
 
 @register.error
 @redeem_code.error
+@bulk_register.error
+@bulk_remove.error
 
 @list_players.error
 
