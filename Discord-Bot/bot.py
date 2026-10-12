@@ -137,19 +137,21 @@ class KingshotBot(discord.Client):
 
 
 
-   async def setup_hook(self) -> None:
-    commands = await self.tree.sync()
-    logger.info(
-        "Synced %d global commands: %s",
-        len(commands),
-        ", ".join(command.name for command in commands),
-    )
-
-    if CONFIG["auto_redeem"].get("enabled", True):
-        self.auto_redeem_loop.change_interval(
-            seconds=CONFIG["auto_redeem"]["poll_interval_seconds"]
+   
+    async def setup_hook(self) -> None:
+        commands = await self.tree.sync()
+        logger.info(
+            "Synced %d global commands: %s",
+            len(commands),
+            ", ".join(command.name for command in commands),
         )
-        self.auto_redeem_loop.start()
+
+        if CONFIG["auto_redeem"].get("enabled", True):
+            self.auto_redeem_loop.change_interval(
+                seconds=CONFIG["auto_redeem"]["poll_interval_seconds"]
+            )
+            self.auto_redeem_loop.start()
+
 
 
 
