@@ -9,7 +9,7 @@
     "logs_file": "data/logs.jsonl"
   },
   "limits": {
-    "max_players_per_user": 2,
+    "max_players_per_user": 100,
     "register_cooldown_seconds": 5,
     "command_cooldown_seconds": 5
   },
