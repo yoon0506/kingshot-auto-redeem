@@ -397,6 +397,41 @@ async def register(interaction: discord.Interaction, player_id: str) -> None:
 
 
 
+@bot.tree.command(name="redeemcode", description="Admin only: queue a gift code for all registered players.")
+@app_commands.describe(code="Kingshot gift code, for example CHALLENGE26")
+@app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
+async def redeem_code(interaction: discord.Interaction, code: str) -> None:
+    if not _is_admin(interaction.user.id):
+        await interaction.response.send_message("This command is for DMD admins only.", ephemeral=True)
+        return
+
+    code = code.strip()
+    if not (3 <= len(code) <= 64 and code.isascii() and code.isalnum()):
+        await interaction.response.send_message(
+            "Invalid gift code. Use 3–64 ASCII letters or digits, without spaces.",
+            ephemeral=True,
+        )
+        return
+
+    saved = await bot.repository.add_manual_code(code)
+    if not saved:
+        await interaction.response.send_message(
+            f"Code `{code}` is marked expired or exhausted in the local cache. Not queued.",
+            ephemeral=True,
+        )
+        return
+
+    await bot.repository.log_event(
+        "manual_code_queued", discordUserId=str(interaction.user.id), code=code
+    )
+    bot.wake_auto_redeem(f"admin queued code {code}")
+    await interaction.response.send_message(
+        f"Queued `{code}` for all registered accounts with auto-redeem enabled. "
+        "This does not guarantee a successful claim; check the hosting logs.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="list", description="List your registered Kingshot players.")
 
 @app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
@@ -598,6 +633,7 @@ async def status(interaction: discord.Interaction, player_id: str) -> None:
 
 
 @register.error
+@redeem_code.error
 
 @list_players.error
 
