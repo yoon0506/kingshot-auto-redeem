@@ -8,9 +8,9 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import time
 from typing import Any
+from collections import Counter
 import aiohttp
 
 logger = logging.getLogger("kingshot-bot.api")
@@ -26,6 +26,8 @@ class KingshotApi:
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self._session: aiohttp.ClientSession | None = None
+        self._redeem_metrics: Counter[str] = Counter()
+        self._redeem_latency_total_ms = 0.0
 
     async def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -59,10 +61,65 @@ class KingshotApi:
             logger.warning("Code discovery request failed: %s", type(exc).__name__)
             return []
 
-    async def redeem_gift_code(self, player_id: str, gift_code: str, kingdom: int | str | None = None) -> dict[str, Any]:
-        # Use each saved player kingdom; preserve the previous default for legacy callers.
-        kingdom = str(kingdom if kingdom is not None else os.getenv("DMD_KINGDOM", "1850"))
-        if not player_id.isdigit() or not kingdom.isdigit():
+    async def redeem_gift_code(self, player_id: str, gift_code: str, kingdom: int | str = 1850) -> dict[str, Any]:
+        """Record privacy-safe request timing without changing redemption semantics."""
+        started = time.perf_counter()
+        try:
+            result = await self._redeem_gift_code_request(player_id, gift_code, kingdom)
+        except Exception:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            self._record_redeem_metric("unexpected_exception", elapsed_ms)
+            raise
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        category = self._redeem_metric_category(result)
+        self._record_redeem_metric(category, elapsed_ms)
+        return result
+
+    @staticmethod
+    def _redeem_metric_category(result: dict[str, Any]) -> str:
+        message = str(result.get("message", "")).upper()
+        raw = result.get("raw") or {}
+        err_code = str(raw.get("err_code", "")) if isinstance(raw, dict) else ""
+        if message.startswith("HTTP 429"):
+            return "http_429"
+        if err_code == "40019" or "TOO FREQUENT" in message:
+            return "uid_40019_or_too_frequent"
+        if "TIMEOUT RETRY" in message or "TIMEOUTERROR" in message:
+            return "timeout"
+        if result.get("success"):
+            return "success"
+        if result.get("already"):
+            return "already"
+        if result.get("expired"):
+            return "expired"
+        if result.get("max_uses_reached"):
+            return "max_uses"
+        if result.get("rate_limited"):
+            return "other_rate_limit"
+        if "USER INFO ERROR" in message:
+            return "invalid_uid_or_kingdom"
+        if message.startswith("HTTP 5"):
+            return "http_5xx"
+        return "other_error"
+
+    def _record_redeem_metric(self, category: str, elapsed_ms: float) -> None:
+        # Only category and duration: never log UID, gift code, signing data or secret.
+        self._redeem_metrics[category] += 1
+        self._redeem_latency_total_ms += elapsed_ms
+        total = self._redeem_metrics.total()
+        logger.info("DMD API metric: category=%s duration_ms=%.0f", category, elapsed_ms)
+        if total % 10 == 0:
+            avg = self._redeem_latency_total_ms / total
+            logger.info(
+                "DMD API metrics summary (since restart): requests=%d avg_ms=%.0f categories=%s",
+                total, avg, dict(sorted(self._redeem_metrics.items())),
+            )
+
+    async def _redeem_gift_code_request(self, player_id: str, gift_code: str, kingdom: int | str = 1850) -> dict[str, Any]:
+        # Use each registered player's kingdom; 1850 remains the legacy default.
+        kingdom = str(kingdom).strip()
+        if not (player_id.isascii() and player_id.isdigit() and kingdom.isascii() and kingdom.isdigit()
+                and 1 <= int(kingdom) <= 99999):
             return self._failure("Invalid UID or kingdom")
         values = {"fid": str(player_id), "cdk": str(gift_code), "kid": kingdom, "time": str(int(time.time()))}
         raw = "&".join(f"{key}={values[key]}" for key in sorted(values))
