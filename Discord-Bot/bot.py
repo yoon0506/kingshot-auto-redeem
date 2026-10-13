@@ -836,6 +836,34 @@ async def bulk_register(interaction: discord.Interaction, ids: str) -> None:
     )
 
 
+@bot.tree.command(name="setkingdom", description="DMD admins: change one registered player's displayed kingdom.")
+@app_commands.describe(uid="Registered Kingshot player UID", kingdom="New kingdom number, e.g. 1844 or 1850")
+@app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
+async def set_kingdom(interaction: discord.Interaction, uid: str, kingdom: int) -> None:
+    if not _is_admin(interaction.user.id):
+        await interaction.response.send_message("DMD admins only.", ephemeral=True)
+        return
+    uid = uid.strip()
+    if not (uid.isascii() and uid.isdigit() and 5 <= len(uid) <= 15):
+        await interaction.response.send_message("UID must contain 5–15 ASCII digits.", ephemeral=True)
+        return
+    if not 1 <= kingdom <= 99999:
+        await interaction.response.send_message("Kingdom must be between 1 and 99999.", ephemeral=True)
+        return
+    status, previous = await bot.repository.set_kingdom(uid, kingdom)
+    if status == "not_found":
+        await interaction.response.send_message(f"UID `{uid}` is not registered.", ephemeral=True)
+        return
+    if status == "changed":
+        await bot.repository.log_event(
+            "admin_kingdom_changed", playerId=uid, oldKingdom=previous,
+            newKingdom=kingdom, adminDiscordUserId=str(interaction.user.id),
+        )
+    result = (f"Kingdom changed: K{previous} → K{kingdom}." if status == "changed"
+              else f"Already set to K{kingdom}; no changes made.")
+    await interaction.response.send_message(f"🍅 UID `{uid}`: {result}", ephemeral=True)
+
+
 @bot.tree.command(name="unregister", description="DMD admins: withdraw one UID without deleting redemption history.")
 @app_commands.describe(uid="Kingshot UID to withdraw")
 @app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
@@ -1254,6 +1282,7 @@ async def status(interaction: discord.Interaction, player_id: str) -> None:
 
 
 
+@set_kingdom.error
 @healthcheck.error
 @register.error
 @redeem_code.error
