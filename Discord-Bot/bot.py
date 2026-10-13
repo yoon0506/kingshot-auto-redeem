@@ -345,37 +345,41 @@ class KingshotBot(discord.Client):
             key = f"{self.report_channel_id}:{code}"
             record = saved.get(key, {})
             expired = (expiry is not None and now >= expiry) or detected_expiry is not None
-            expiry_signature = ((expiry.isoformat() if expiry else 'unknown') + ':' +
-                                (detected_expiry.isoformat() if detected_expiry else '-') +
-                                (':expired' if expired else ':active'))
+            expiry_signature = ('expired' if expired else
+                                'active' if expiry is not None else 'unknown')
             if not force and record.get('signature') == signature and record.get('expiry_signature') == expiry_signature:
                 return "Report unchanged."
 
             finished = stats['total'] - stats['pending']
-            label = "🔴 만료" if expired else ("🟢 유효기간 내" if expiry else "⚪ 만료 시각 미확인")
-            if expiry:
-                kst = expiry.astimezone(timezone(timedelta(hours=9)))
-                expiry_info = (f"🇰🇷 KST: {kst:%Y.%m.%d %H:%M}\n"
-                               f"🌐 UTC: {expiry:%Y.%m.%d %H:%M}")
+            if expired:
+                label = "🔴 만료"
+            elif expiry is not None:
+                label = "🟢 진행 중"
             else:
-                expiry_info = "정확한 만료 시각이 제공되지 않았습니다."
-                if detected_expiry:
-                    detected_kst = detected_expiry.astimezone(timezone(timedelta(hours=9)))
-                    expiry_info += (f"\n만료 감지: KST {detected_kst:%Y.%m.%d %H:%M} / "
-                                    f"UTC {detected_expiry:%Y.%m.%d %H:%M}")
+                label = "⚪ 만료 여부 미확인"
+
+            # Don't show an update frequency on archived expired reports.
+            progress = f"왕국 1850 · 진행 {finished}/{stats['total']}명"
+            if not expired:
+                progress += " · 5분마다 확인"
+
             embed = discord.Embed(
                 title=f"🍅 DMD Gift Code — {code}",
-                description=(f"왕국 1850 · 진행 {finished}/{stats['total']}명 · 5분마다 확인\n"
-                             f"상태: {label}\n{expiry_info}"),
-                color=discord.Color.dark_grey() if expired else (discord.Color.green() if stats['pending'] == 0 and stats['failed'] == 0 else discord.Color.orange()),
+                description=f"{progress}\n\n**상태: {label}**",
+                color=(discord.Color.dark_grey() if expired
+                       else discord.Color.green() if stats['pending'] == 0 and stats['failed'] == 0
+                       else discord.Color.orange()),
             )
-            embed.add_field(name="✅ 서버 성공 응답", value=str(stats['success']), inline=True)
+            embed.add_field(name="✅ 성공 응답", value=str(stats['success']), inline=True)
             embed.add_field(name="🔁 이미 수령", value=str(stats['already']), inline=True)
-            embed.add_field(name="❌ 실패 / 재시도 대상", value=str(stats['failed']), inline=True)
-            embed.add_field(name="⏳ 아직 성공 기록 없음", value=str(stats['pending']), inline=True)
+            embed.add_field(name="❌ 실패/재시도", value=str(stats['failed']), inline=True)
+            embed.add_field(name="⏳ 미확인", value=str(stats['pending']), inline=True)
             if stats['accepted_unknown']:
-                embed.add_field(name="📋 성공 분류 불명", value=str(stats['accepted_unknown']), inline=True)
-            embed.set_footer(text="봇의 API 결과 기준 · 실제 게임 우편함 지급 여부는 별도 확인 필요")
+                embed.add_field(name="📋 결과 분류 불명", value=str(stats['accepted_unknown']), inline=True)
+            embed.set_footer(
+                text="봇의 API 결과 기준 · 실제 우편함 지급 여부는 게임 내에서 확인해 주세요.\n"
+                     "토마토를 많이 많이 먹으세요! 🍅🍅🍅🍅🍅"
+            )
 
             message = None
             if record.get('message_id'):
