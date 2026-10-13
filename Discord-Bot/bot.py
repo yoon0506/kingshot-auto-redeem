@@ -711,6 +711,53 @@ async def bulk_register(interaction: discord.Interaction, ids: str) -> None:
     )
 
 
+@bot.tree.command(name="unregister", description="DMD admins: withdraw one UID without deleting redemption history.")
+@app_commands.describe(uid="Kingshot UID to withdraw")
+@app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
+async def unregister(interaction: discord.Interaction, uid: str) -> None:
+    if not _is_admin(interaction.user.id):
+        await interaction.response.send_message("DMD admins only.", ephemeral=True)
+        return
+    uid = uid.strip()
+    if not (uid.isascii() and uid.isdigit() and 5 <= len(uid) <= 15):
+        await interaction.response.send_message("UID must contain 5–15 ASCII digits.", ephemeral=True)
+        return
+    status = await bot.repository.set_withdrawn(uid, True)
+    if status == "not_found":
+        await interaction.response.send_message(f"UID `{uid}` is not registered.", ephemeral=True)
+        return
+    if status == "changed":
+        await bot.repository.log_event("admin_player_withdrawn", playerId=uid, adminDiscordUserId=str(interaction.user.id))
+    await interaction.response.send_message(
+        f"🍅 UID `{uid}`: " + ("withdrawn. Auto redeem OFF; history preserved." if status == "changed" else "already withdrawn."),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="reactivate", description="DMD admins: reactivate a withdrawn UID and preserve history.")
+@app_commands.describe(uid="Previously withdrawn Kingshot UID")
+@app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
+async def reactivate(interaction: discord.Interaction, uid: str) -> None:
+    if not _is_admin(interaction.user.id):
+        await interaction.response.send_message("DMD admins only.", ephemeral=True)
+        return
+    uid = uid.strip()
+    if not (uid.isascii() and uid.isdigit() and 5 <= len(uid) <= 15):
+        await interaction.response.send_message("UID must contain 5–15 ASCII digits.", ephemeral=True)
+        return
+    status = await bot.repository.set_withdrawn(uid, False)
+    if status == "not_found":
+        await interaction.response.send_message(f"UID `{uid}` is not registered.", ephemeral=True)
+        return
+    if status == "changed":
+        await bot.repository.log_event("admin_player_reactivated", playerId=uid, adminDiscordUserId=str(interaction.user.id))
+        bot.wake_auto_redeem(f"admin reactivated player {uid}")
+    await interaction.response.send_message(
+        f"🍅 UID `{uid}`: " + ("reactivated. Auto redeem ON; history preserved." if status == "changed" else "not withdrawn; no change."),
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="bulkremove", description="DMD admins: remove up to 50 player UIDs, including other users' records.")
 @app_commands.describe(ids="Comma, space, or newline separated UIDs", confirm="Must be True to permanently remove accounts and redemption history")
 @app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
@@ -1014,6 +1061,10 @@ async def _set_auto_redeem(interaction: discord.Interaction, player_id: str, ena
 
 
 
+    if enabled and player.get("withdrawn", False):
+        await interaction.response.send_message("This UID was withdrawn. Ask an admin to use /reactivate.", ephemeral=True)
+        return
+
     await bot.repository.set_auto_redeem(player_id, enabled)
 
     await bot.repository.log_event(
@@ -1073,6 +1124,8 @@ async def status(interaction: discord.Interaction, player_id: str) -> None:
 @redeem_report.error
 @edit_ment.error
 @set_code_expiry.error
+@unregister.error
+@reactivate.error
 @bulk_register.error
 @bulk_remove.error
 
