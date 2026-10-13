@@ -42,6 +42,31 @@ ROOT = Path(__file__).resolve().parent
 
 CONFIG = load_config(ROOT / "config.json")
 
+# Administrator-editable footer, stored in the persistent data directory.
+REPORT_MENT_FILE = ROOT / "data" / "report_ment.json"
+DEFAULT_REPORT_MENT = "토마토를 많이 많이 먹으세요! 🍅🍅🍅🍅🍅"
+
+
+def load_report_ment() -> str:
+    try:
+        data = json.loads(REPORT_MENT_FILE.read_text(encoding="utf-8"))
+        value = data.get("ment") if isinstance(data, dict) else None
+        if isinstance(value, str) and value.strip():
+            return value
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not load report ment: %s", exc)
+    return DEFAULT_REPORT_MENT
+
+
+def save_report_ment(value: str) -> None:
+    REPORT_MENT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = REPORT_MENT_FILE.with_suffix(".json.tmp")
+    temp.write_text(json.dumps({"ment": value}, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp, REPORT_MENT_FILE)
+
+
 
 
 logging.basicConfig(
@@ -347,7 +372,11 @@ class KingshotBot(discord.Client):
             expired = (expiry is not None and now >= expiry) or detected_expiry is not None
             expiry_signature = ('expired' if expired else
                                 'active' if expiry is not None else 'unknown')
-            if not force and record.get('signature') == signature and record.get('expiry_signature') == expiry_signature:
+            ment = load_report_ment()
+            ment_signature = hashlib.sha256(ment.encode("utf-8")).hexdigest()
+            if (not force and record.get('signature') == signature
+                    and record.get('expiry_signature') == expiry_signature
+                    and record.get('ment_signature') == ment_signature):
                 return "Report unchanged."
 
             finished = stats['total'] - stats['pending']
@@ -378,7 +407,7 @@ class KingshotBot(discord.Client):
                 embed.add_field(name="📋 결과 분류 불명", value=str(stats['accepted_unknown']), inline=True)
             embed.set_footer(
                 text="봇의 API 결과 기준 · 실제 우편함 지급 여부는 게임 내에서 확인해 주세요.\n"
-                     "토마토를 많이 많이 먹으세요! 🍅🍅🍅🍅🍅"
+                     + ment
             )
 
             message = None
@@ -397,7 +426,7 @@ class KingshotBot(discord.Client):
                 except (discord.Forbidden, discord.HTTPException) as exc:
                     logger.warning("Report send failed: %s", type(exc).__name__)
                     return "Cannot send to report channel."
-            saved[key] = {'message_id': message.id, 'signature': signature, 'expiry_signature': expiry_signature}
+            saved[key] = {'message_id': message.id, 'signature': signature, 'expiry_signature': expiry_signature, 'ment_signature': ment_signature}
             self.report_store.save_messages(saved)
             return f"Report posted/updated for {code}."
 
@@ -780,6 +809,55 @@ async def redeem_report(interaction: discord.Interaction, code: str) -> None:
     await interaction.followup.send(result, ephemeral=True)
 
 
+@bot.tree.command(name="editment", description="DMD admins: edit the message under every gift-code report.")
+@app_commands.describe(ment="New footer text (maximum 300 characters); use 'reset' to restore the default")
+@app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
+async def edit_ment(interaction: discord.Interaction, ment: str) -> None:
+    if not _is_admin(interaction.user.id):
+        await interaction.response.send_message("DMD admins only.", ephemeral=True)
+        return
+    new_ment = DEFAULT_REPORT_MENT if ment.strip().lower() == "reset" else ment.strip()
+    if not new_ment or len(new_ment) > 300:
+        await interaction.response.send_message("Enter 1–300 characters, or `reset`.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        save_report_ment(new_ment)
+    except OSError:
+        logger.exception("Saving report ment failed")
+        await interaction.followup.send("Could not save the message. Check the data directory permissions.", ephemeral=True)
+        return
+
+    # Refresh only existing report messages, including archived expired reports.
+    # Do not create new coupon reports merely because the footer changed.
+    refreshed = 0
+    unsuccessful = 0
+    if bot.report_channel_id:
+        saved = bot.report_store.load_messages()
+        prefix = f"{bot.report_channel_id}:"
+        codes = [key[len(prefix):] for key in saved if key.startswith(prefix)]
+        for code in codes:
+            try:
+                result = await bot.publish_redeem_report(code, force=True)
+                if result.startswith("Report posted/updated"):
+                    refreshed += 1
+                else:
+                    unsuccessful += 1
+                    logger.warning("Footer refresh skipped for %s: %s", code, result)
+            except Exception:
+                unsuccessful += 1
+                logger.exception("Footer refresh failed for coupon %s", code)
+    # Ensure the next scheduled cycle does not skip any changed records.
+    bot._report_last_snapshot = None
+    await interaction.followup.send(
+        f"✅ 리포트 하단 문구를 저장했어요!\n"
+        f"새 문구: {new_ment}\n"
+        f"기존 리포트 갱신: {refreshed}개 / 갱신 실패·보류: {unsuccessful}개\n"
+        "일부가 갱신되지 않았다면 `/redeemreport`로 다시 갱신할 수 있어요.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="list", description="List your registered Kingshot players.")
 
 @app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
@@ -983,6 +1061,7 @@ async def status(interaction: discord.Interaction, player_id: str) -> None:
 @register.error
 @redeem_code.error
 @redeem_report.error
+@edit_ment.error
 @set_code_expiry.error
 @bulk_register.error
 @bulk_remove.error
