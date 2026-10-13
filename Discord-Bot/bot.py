@@ -31,6 +31,7 @@ from kingshot.redeemer import AutoRedeemer
 
 from kingshot.repository import JsonRepository
 from kingshot.reporting import ReportStore
+from kingshot.form_names import update_player_names
 
 from kingshot.ui import build_player_embed, build_player_embeds
 
@@ -276,7 +277,9 @@ class KingshotBot(discord.Client):
             logger.warning("DMD form sync returned an invalid player list")
             return
 
-        ids = []
+        # Keep names as well as UIDs: a renamed player must trigger a sync.
+        # For duplicate form submissions, the latest non-empty nickname wins.
+        names: dict[str, str] = {}
         invalid_count = 0
         for player in players:
             if not isinstance(player, dict) or str(player.get("kingdom")) != "1850":
@@ -286,29 +289,34 @@ class KingshotBot(discord.Client):
             if not (uid.isascii() and uid.isdecimal() and 5 <= len(uid) <= 15):
                 invalid_count += 1
                 continue
-            ids.append(uid)
+            name = str(player.get("name") or "").strip()
+            name = " ".join(name.split())[:80]
+            if uid not in names or name:
+                names[uid] = name or names.get(uid, "")
 
-        ids = list(dict.fromkeys(ids))
-        if not ids:
+        if not names:
             logger.info("DMD form sync: no valid UIDs (invalid=%d)", invalid_count)
             return
 
-        # Do not write existing players to disk on every poll.
-        # Use the validated UID set rather than the raw JSON response so
-        # harmless differences in row formatting do not trigger work.
-        digest = hashlib.sha256("\n".join(sorted(ids)).encode("ascii")).hexdigest()
+        # Include normalized names in the digest, so nickname edits are not missed.
+        normalized = json.dumps(sorted(names.items()), ensure_ascii=False, separators=(",", ":"))
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         if digest == self._form_last_digest:
-            logger.debug("DMD form sync: no UID changes; registration skipped")
+            logger.debug("DMD form sync: UID/nickname inputs unchanged; skipped")
             return
 
-        # Work in batches to avoid large write operations on the free host.
         added_count = 0
         existing_count = 0
+        changed_names = 0
         try:
+            ids = list(names)
             for start in range(0, len(ids), 50):
-                result = await self.repository.bulk_register(owner_id, ids[start:start+50], kingdom=1850)
+                result = await self.repository.bulk_register(owner_id, ids[start:start + 50], kingdom=1850)
                 added_count += len(result["added"])
                 existing_count += len(result["existing"])
+            # Only update playerName on existing records. No redemption history,
+            # account ownership, or auto-redeem settings are modified.
+            changed_names = await update_player_names(self.repository, names)
             if added_count:
                 await self.repository.log_event(
                     "google_form_players_registered", added=added_count,
@@ -318,10 +326,11 @@ class KingshotBot(discord.Client):
         except Exception:
             logger.exception("DMD form sync failed while saving players")
             return
-        self._form_last_digest = digest  # Only advance after successful persistence.
+
+        self._form_last_digest = digest
         logger.info(
-            "DMD form sync finished: added=%d existing=%d invalid=%d",
-            added_count, existing_count, invalid_count,
+            "DMD form sync finished: added=%d existing=%d renamed=%d invalid=%d",
+            added_count, existing_count, changed_names, invalid_count,
         )
 
     @tasks.loop(minutes=5)
