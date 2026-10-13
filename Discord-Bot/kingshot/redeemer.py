@@ -457,7 +457,9 @@ class AutoRedeemer:
 
 
 
-        result = await self.api.redeem_gift_code(player_id, code)
+        result = await self.api.redeem_gift_code(
+            player_id, code, kingdom=player.get("kingdom") or 1850
+        )
 
         if result["success"] or result["already"]:
 
