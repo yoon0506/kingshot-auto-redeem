@@ -59,8 +59,9 @@ class KingshotApi:
             logger.warning("Code discovery request failed: %s", type(exc).__name__)
             return []
 
-    async def redeem_gift_code(self, player_id: str, gift_code: str) -> dict[str, Any]:
-        kingdom = str(os.getenv("DMD_KINGDOM", "1850"))
+    async def redeem_gift_code(self, player_id: str, gift_code: str, kingdom: int | str | None = None) -> dict[str, Any]:
+        # Use each saved player kingdom; preserve the previous default for legacy callers.
+        kingdom = str(kingdom if kingdom is not None else os.getenv("DMD_KINGDOM", "1850"))
         if not player_id.isdigit() or not kingdom.isdigit():
             return self._failure("Invalid UID or kingdom")
         values = {"fid": str(player_id), "cdk": str(gift_code), "kid": kingdom, "time": str(int(time.time()))}
@@ -100,7 +101,7 @@ class KingshotApi:
         expired = msg in {"TIME ERROR", "CDK NOT FOUND"}
         max_uses = msg == "USED"
         if msg == "USER INFO ERROR" or err == "40020":
-            msg = "Wrong kingdom or invalid UID for K1850 (USER INFO ERROR)"
+            msg = f"Wrong kingdom or invalid UID for K{kingdom} (USER INFO ERROR)"
         return {
             "success": success, "already": already,
             "rate_limited": rate_limited, "expired": expired,
