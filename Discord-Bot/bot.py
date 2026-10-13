@@ -298,6 +298,7 @@ class KingshotBot(discord.Client):
         # Keep names as well as UIDs: a renamed player must trigger a sync.
         # For duplicate form submissions, the latest non-empty nickname wins.
         names: dict[str, str] = {}
+        alliances: dict[str, int] = {}
         invalid_count = 0
         for player in players:
             if not isinstance(player, dict) or str(player.get("kingdom")) != "1850":
@@ -311,13 +312,20 @@ class KingshotBot(discord.Client):
             name = " ".join(name.split())[:80]
             if uid not in names or name:
                 names[uid] = name or names.get(uid, "")
+            alliance_id = player.get("allianceId")
+            if type(alliance_id) is int and alliance_id in (0, 1, 2, 3):
+                alliances[uid] = alliance_id
 
         if not names:
             logger.info("DMD form sync: no valid UIDs (invalid=%d)", invalid_count)
             return
 
-        # Include normalized names in the digest, so nickname edits are not missed.
-        normalized = json.dumps(sorted(names.items()), ensure_ascii=False, separators=(",", ":"))
+        # Include alliance choices so new form submissions trigger sync, even
+        # when UID/nickname stay unchanged.
+        normalized = json.dumps(
+            sorted((uid, name, alliances.get(uid)) for uid, name in names.items()),
+            ensure_ascii=False, separators=(",", ":"),
+        )
         digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         if digest == self._form_last_digest:
             self._health_form_ok = datetime.now(timezone.utc)
@@ -327,6 +335,7 @@ class KingshotBot(discord.Client):
         added_count = 0
         existing_count = 0
         changed_names = 0
+        changed_alliances = 0
         try:
             ids = list(names)
             for start in range(0, len(ids), 50):
@@ -336,6 +345,7 @@ class KingshotBot(discord.Client):
             # Only update playerName on existing records. No redemption history,
             # account ownership, or auto-redeem settings are modified.
             changed_names = await update_player_names(self.repository, names)
+            changed_alliances = await self.repository.update_form_alliances(alliances)
             if added_count:
                 await self.repository.log_event(
                     "google_form_players_registered", added=added_count,
@@ -349,8 +359,8 @@ class KingshotBot(discord.Client):
         self._form_last_digest = digest
         self._health_form_ok = datetime.now(timezone.utc)
         logger.info(
-            "DMD form sync finished: added=%d existing=%d renamed=%d invalid=%d",
-            added_count, existing_count, changed_names, invalid_count,
+            "DMD form sync finished: added=%d existing=%d renamed=%d alliance_changed=%d invalid=%d",
+            added_count, existing_count, changed_names, changed_alliances, invalid_count,
         )
 
     @tasks.loop(minutes=5)
@@ -864,6 +874,62 @@ async def set_kingdom(interaction: discord.Interaction, uid: str, kingdom: int) 
     await interaction.response.send_message(f"🍅 UID `{uid}`: {result}", ephemeral=True)
 
 
+@bot.tree.command(name="setalliance", description="DMD admins: assign a registered UID to an alliance ID.")
+@app_commands.describe(uid="Registered Kingshot UID", alliance_id="0=DMD, 1=MVP, 2=HEX, 3=OTHER")
+@app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
+async def set_alliance(interaction: discord.Interaction, uid: str, alliance_id: int) -> None:
+    if not _is_admin(interaction.user.id):
+        await interaction.response.send_message("DMD admins only.", ephemeral=True)
+        return
+    uid = uid.strip()
+    if not (uid.isascii() and uid.isdigit() and 5 <= len(uid) <= 15):
+        await interaction.response.send_message("UID must contain 5–15 ASCII digits.", ephemeral=True)
+        return
+    names = await bot.repository.list_alliances()
+    if alliance_id not in names:
+        await interaction.response.send_message("Alliance ID must be 0, 1, 2, or 3.", ephemeral=True)
+        return
+    status, old_id = await bot.repository.set_alliance(uid, alliance_id)
+    if status == "not_found":
+        await interaction.response.send_message(f"UID `{uid}` is not registered.", ephemeral=True)
+        return
+    if status == "changed":
+        await bot.repository.log_event(
+            "admin_alliance_changed", playerId=uid, oldAllianceId=old_id,
+            newAllianceId=alliance_id, adminDiscordUserId=str(interaction.user.id),
+        )
+    message = (f"{names[old_id]} ({old_id}) → {names[alliance_id]} ({alliance_id})" if status == "changed"
+               else f"Already {names[alliance_id]} ({alliance_id})")
+    await interaction.response.send_message(f"🍅 UID `{uid}`: {message}", ephemeral=True)
+
+
+@bot.tree.command(name="renamealliance", description="DMD admins: rename one alliance without updating player IDs.")
+@app_commands.describe(alliance_id="0=DMD, 1=MVP, 2=HEX, 3=OTHER", name="New alliance name (1–32 characters)")
+@app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
+async def rename_alliance(interaction: discord.Interaction, alliance_id: int, name: str) -> None:
+    if not _is_admin(interaction.user.id):
+        await interaction.response.send_message("DMD admins only.", ephemeral=True)
+        return
+    if alliance_id not in (0, 1, 2, 3):
+        await interaction.response.send_message("Alliance ID must be 0, 1, 2, or 3.", ephemeral=True)
+        return
+    name = name.strip()
+    if not (1 <= len(name) <= 32) or any(ord(c) < 32 for c in name):
+        await interaction.response.send_message("Name must be 1–32 characters without line breaks or control characters.", ephemeral=True)
+        return
+    status, previous = await bot.repository.rename_alliance(alliance_id, name)
+    if status == "duplicate":
+        await interaction.response.send_message("That name belongs to another alliance ID.", ephemeral=True)
+        return
+    if status == "changed":
+        await bot.repository.log_event(
+            "admin_alliance_renamed", allianceId=alliance_id, oldName=previous,
+            newName=name, adminDiscordUserId=str(interaction.user.id),
+        )
+    message = f"{previous} → {name}" if status == "changed" else f"Already named {name}"
+    await interaction.response.send_message(f"🍅 Alliance `{alliance_id}`: {message}", ephemeral=True)
+
+
 @bot.tree.command(name="unregister", description="DMD admins: withdraw one UID without deleting redemption history.")
 @app_commands.describe(uid="Kingshot UID to withdraw")
 @app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
@@ -1135,12 +1201,17 @@ async def list_all_players(interaction: discord.Interaction) -> None:
 
 
     pages = _chunks(players, 10)
+    alliance_names = await bot.repository.list_alliances()
 
     for page_number, page in enumerate(pages, start=1):
 
         await interaction.followup.send(
 
-            content=f"All registered players: `{len(players)}` | page `{page_number}/{len(pages)}`",
+            content=(f"All registered players: `{len(players)}` | page `{page_number}/{len(pages)}`\n"
+                     + "\n".join(
+                         f"`{p['playerId']}` · {alliance_names.get(int(p.get('allianceId', 3) if p.get('allianceId') is not None else 3), 'OTHER')}"
+                         for p in page
+                     )),
 
             embeds=build_player_embeds(page, mode="compact"),
 
@@ -1282,6 +1353,8 @@ async def status(interaction: discord.Interaction, player_id: str) -> None:
 
 
 
+@set_alliance.error
+@rename_alliance.error
 @set_kingdom.error
 @healthcheck.error
 @register.error
