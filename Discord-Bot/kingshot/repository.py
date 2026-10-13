@@ -215,6 +215,23 @@ class JsonRepository:
                 self._save_json(self.users_path, users)
             return {"added": added, "existing": existing}
 
+    async def set_kingdom(self, player_id: str, kingdom: int) -> tuple[str, int | None]:
+        """Update only one registered player's displayed kingdom, atomically."""
+        if not (1 <= kingdom <= 99999):
+            raise ValueError("Kingdom must be between 1 and 99999")
+        async with self._lock:
+            data = self._load_json(self.players_path, {"schemaVersion": 1, "players": {}})
+            player = data.get("players", {}).get(str(player_id))
+            if not isinstance(player, dict):
+                return "not_found", None
+            old = player.get("kingdom")
+            if str(old) == str(kingdom):
+                return "unchanged", old
+            player["kingdom"] = kingdom
+            player["updatedAt"] = utc_now_iso()
+            self._save_json(self.players_path, data)
+            return "changed", old
+
     async def set_withdrawn(self, player_id: str, withdrawn: bool) -> str:
         """Admin-only state transition; retain existing redemption history."""
         async with self._lock:
