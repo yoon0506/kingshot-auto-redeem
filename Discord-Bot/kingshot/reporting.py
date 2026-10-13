@@ -93,8 +93,16 @@ class ReportStore:
             if os.path.exists(path):
                 os.unlink(path)
 
-    async def summary(self, code: str) -> dict[str, int]:
-        records = await self.repo.list_auto_redeem_players()
+    async def summary(self, code: str, *, registered_before: datetime | None = None) -> dict[str, int]:
+        # For legacy expired codes, reconstruct the eligible cohort from saved
+        # registration timestamps. This is a best-effort historical snapshot.
+        if registered_before is None:
+            records = await self.repo.list_auto_redeem_players()
+        else:
+            records = await self.repo.list_all_players()
+            records = [p for p in records
+                       if (stamp := _utc(p.get('registeredAt', '')))
+                       and stamp <= registered_before]
         code = str(code)
         redeemed = {}
         for player in records:
