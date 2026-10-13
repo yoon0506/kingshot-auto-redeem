@@ -361,9 +361,33 @@ class KingshotBot(discord.Client):
         detected_expiry = self.report_store.detected_expired_at(code)
         now = datetime.now(timezone.utc)
         async with self._report_lock:
-            stats = await self.report_store.summary(code)
+            saved = self.report_store.load_messages()
+            key = f"{self.report_channel_id}:{code}"
+            record = saved.get(key, {})
+            expiry_cutoff = detected_expiry or (expiry if expiry and now >= expiry else None)
+            expired = expiry_cutoff is not None
+            # A frozen report is immutable in its counters, even if members
+            # register afterwards or an administrator forces a refresh.
+            frozen = record.get('frozen_stats') if isinstance(record, dict) else None
+            valid_keys = ('total', 'success', 'already', 'accepted_unknown', 'failed', 'pending')
+            if expired and isinstance(frozen, dict) and all(
+                isinstance(frozen.get(k), int) and frozen[k] >= 0 for k in valid_keys
+            ):
+                stats = {k: frozen[k] for k in valid_keys}
+            else:
+                stats = await self.report_store.summary(
+                    code, registered_before=expiry_cutoff if expired else None
+                )
+                if expired:
+                    # Persist before posting, so retries or restarts cannot
+                    # alter the counters while an HTTP request is in flight.
+                    record = dict(record) if isinstance(record, dict) else {}
+                    record['frozen_stats'] = {k: stats[k] for k in valid_keys}
+                    record['frozen_at'] = now.isoformat()
+                    saved[key] = record
+                    self.report_store.save_messages(saved)
             if stats['total'] == 0:
-                return "No registered players with auto-redeem enabled."
+                return "No eligible player records for this gift code."
             channel = self.get_channel(self.report_channel_id)
             if channel is None:
                 try:
@@ -373,12 +397,7 @@ class KingshotBot(discord.Client):
                     return "Cannot access the configured report channel."
             if not hasattr(channel, 'send') or not hasattr(channel, 'fetch_message'):
                 return "Report channel must be a text channel."
-            signature = "/".join(str(stats[key]) for key in (
-                'total', 'success', 'already', 'accepted_unknown', 'failed', 'pending'))
-            saved = self.report_store.load_messages()
-            key = f"{self.report_channel_id}:{code}"
-            record = saved.get(key, {})
-            expired = (expiry is not None and now >= expiry) or detected_expiry is not None
+            signature = "/".join(str(stats[key]) for key in valid_keys)
             expiry_signature = ('expired' if expired else
                                 'active' if expiry is not None else 'unknown')
             ment = load_report_ment()
@@ -398,7 +417,8 @@ class KingshotBot(discord.Client):
                 label = "🟢 진행 중"
 
             # Don't show an update frequency on archived expired reports.
-            progress = f"왕국 1850 · 진행 {finished}/{stats['total']}명"
+            progress = (f"왕국 1850 · 최종 처리 {finished}/{stats['total']}명" if expired
+                        else f"왕국 1850 · 진행 {finished}/{stats['total']}명")
             if not expired:
                 progress += " · 5분마다 확인"
 
@@ -436,7 +456,13 @@ class KingshotBot(discord.Client):
                 except (discord.Forbidden, discord.HTTPException) as exc:
                     logger.warning("Report send failed: %s", type(exc).__name__)
                     return "Cannot send to report channel."
-            saved[key] = {'message_id': message.id, 'signature': signature, 'expiry_signature': expiry_signature, 'ment_signature': ment_signature}
+            saved[key] = {
+                **(record if isinstance(record, dict) else {}),
+                'message_id': message.id,
+                'signature': signature,
+                'expiry_signature': expiry_signature,
+                'ment_signature': ment_signature,
+            }
             self.report_store.save_messages(saved)
             return f"Report posted/updated for {code}."
 
