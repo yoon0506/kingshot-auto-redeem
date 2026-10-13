@@ -20,6 +20,7 @@ class ReportStore:
     def __init__(self, repository):
         self.repo = repository
         self.message_path = repository.root / 'data' / 'dmd_report_messages.json'
+        self.expiry_path = repository.root / 'data' / 'dmd_code_expiries.json'
 
     def recent_codes(self, *, hours: int = 48) -> list[str]:
         try:
@@ -35,6 +36,47 @@ class ReportStore:
             if first_seen and now - timedelta(hours=hours) <= first_seen <= now + timedelta(minutes=5):
                 recent.append((first_seen, str(code)))
         return [code for _, code in sorted(recent, reverse=True)]
+
+
+    def expiry_for(self, code: str) -> datetime | None:
+        """Only known explicit UTC expirations; never guess an expiry date."""
+        try:
+            manual = json.loads(self.expiry_path.read_text(encoding='utf-8'))
+            if str(code) in manual:
+                return _utc(manual[str(code)])
+        except (FileNotFoundError, ValueError, OSError, TypeError):
+            pass
+        return None
+
+    def detected_expired_at(self, code: str) -> datetime | None:
+        """When the bot marked expiry, not necessarily the actual expiry time."""
+        try:
+            codes = json.loads(self.repo.codes_path.read_text(encoding='utf-8'))
+            entry = codes.get('knownCodes', {}).get(str(code), {})
+            return _utc(entry.get('expiredAt')) if isinstance(entry, dict) else None
+        except (FileNotFoundError, ValueError, OSError, TypeError):
+            return None
+
+    def set_expiry(self, code: str, expires: datetime) -> None:
+        """Atomically store UTC expiration without changing redemption history."""
+        try:
+            current = json.loads(self.expiry_path.read_text(encoding='utf-8'))
+            if not isinstance(current, dict):
+                current = {}
+        except (FileNotFoundError, ValueError, OSError):
+            current = {}
+        current[str(code)] = expires.astimezone(timezone.utc).isoformat()
+        import os
+        import tempfile
+        self.expiry_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, path = tempfile.mkstemp(dir=self.expiry_path.parent, suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as out:
+                json.dump(current, out, ensure_ascii=False, indent=2)
+            os.replace(path, self.expiry_path)
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
 
     async def summary(self, code: str) -> dict[str, int]:
         records = await self.repo.list_auto_redeem_players()
