@@ -4,6 +4,7 @@ import json
 import logging
 
 import os
+from datetime import datetime, timedelta, timezone
 import re
 
 from pathlib import Path
@@ -295,6 +296,9 @@ class KingshotBot(discord.Client):
         """Maintain a single private-channel message per code across restarts."""
         if not self.report_channel_id:
             return "DMD_REPORT_CHANNEL_ID is not configured."
+        expiry = self.report_store.expiry_for(code)
+        detected_expiry = self.report_store.detected_expired_at(code)
+        now = datetime.now(timezone.utc)
         async with self._report_lock:
             stats = await self.report_store.summary(code)
             if stats['total'] == 0:
@@ -313,14 +317,30 @@ class KingshotBot(discord.Client):
             saved = self.report_store.load_messages()
             key = f"{self.report_channel_id}:{code}"
             record = saved.get(key, {})
-            if not force and record.get('signature') == signature:
+            expired = (expiry is not None and now >= expiry) or detected_expiry is not None
+            expiry_signature = ((expiry.isoformat() if expiry else 'unknown') + ':' +
+                                (detected_expiry.isoformat() if detected_expiry else '-') +
+                                (':expired' if expired else ':active'))
+            if not force and record.get('signature') == signature and record.get('expiry_signature') == expiry_signature:
                 return "Report unchanged."
 
             finished = stats['total'] - stats['pending']
+            label = "🔴 만료" if expired else ("🟢 유효기간 내" if expiry else "⚪ 만료 시각 미확인")
+            if expiry:
+                kst = expiry.astimezone(timezone(timedelta(hours=9)))
+                expiry_info = (f"🇰🇷 KST: {kst:%Y.%m.%d %H:%M}\n"
+                               f"🌐 UTC: {expiry:%Y.%m.%d %H:%M}")
+            else:
+                expiry_info = "정확한 만료 시각이 제공되지 않았습니다."
+                if detected_expiry:
+                    detected_kst = detected_expiry.astimezone(timezone(timedelta(hours=9)))
+                    expiry_info += (f"\n만료 감지: KST {detected_kst:%Y.%m.%d %H:%M} / "
+                                    f"UTC {detected_expiry:%Y.%m.%d %H:%M}")
             embed = discord.Embed(
                 title=f"🍅 DMD Gift Code — {code}",
-                description=f"왕국 1850 · 진행 {finished}/{stats['total']}명 · 5분마다 갱신",
-                color=discord.Color.green() if stats['pending'] == 0 and stats['failed'] == 0 else discord.Color.orange(),
+                description=(f"왕국 1850 · 진행 {finished}/{stats['total']}명 · 5분마다 확인\n"
+                             f"상태: {label}\n{expiry_info}"),
+                color=discord.Color.dark_grey() if expired else (discord.Color.green() if stats['pending'] == 0 and stats['failed'] == 0 else discord.Color.orange()),
             )
             embed.add_field(name="✅ 서버 성공 응답", value=str(stats['success']), inline=True)
             embed.add_field(name="🔁 이미 수령", value=str(stats['already']), inline=True)
@@ -346,7 +366,7 @@ class KingshotBot(discord.Client):
                 except (discord.Forbidden, discord.HTTPException) as exc:
                     logger.warning("Report send failed: %s", type(exc).__name__)
                     return "Cannot send to report channel."
-            saved[key] = {'message_id': message.id, 'signature': signature}
+            saved[key] = {'message_id': message.id, 'signature': signature, 'expiry_signature': expiry_signature}
             self.report_store.save_messages(saved)
             return f"Report posted/updated for {code}."
 
@@ -689,6 +709,31 @@ async def redeem_code(interaction: discord.Interaction, code: str) -> None:
     )
 
 
+@bot.tree.command(name="setcodeexpiry", description="DMD admins: set a gift code expiry date in UTC.")
+@app_commands.describe(code="Gift code", utc="UTC expiry: YYYY-MM-DD HH:MM (24-hour)")
+async def set_code_expiry(interaction: discord.Interaction, code: str, utc: str) -> None:
+    if not _is_admin(interaction.user.id):
+        await interaction.response.send_message("DMD admins only.", ephemeral=True)
+        return
+    code = code.strip()
+    if not (3 <= len(code) <= 64 and code.isascii() and code.isalnum()):
+        await interaction.response.send_message("Invalid gift code.", ephemeral=True)
+        return
+    try:
+        expiry = datetime.strptime(utc.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        await interaction.response.send_message("Use UTC format YYYY-MM-DD HH:MM (e.g. 2026-10-20 00:00).", ephemeral=True)
+        return
+    bot.report_store.set_expiry(code, expiry)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await bot.publish_redeem_report(code, force=True)
+    kst = expiry.astimezone(timezone(timedelta(hours=9)))
+    await interaction.followup.send(
+        f"{code}: UTC {expiry:%Y-%m-%d %H:%M} / KST {kst:%Y-%m-%d %H:%M}\n{result}",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="redeemreport", description="DMD admins: publish or refresh one coupon progress report.")
 @app_commands.describe(code="Gift code to report, e.g. CHALLENGE26")
 async def redeem_report(interaction: discord.Interaction, code: str) -> None:
@@ -907,6 +952,7 @@ async def status(interaction: discord.Interaction, player_id: str) -> None:
 @register.error
 @redeem_code.error
 @redeem_report.error
+@set_code_expiry.error
 @bulk_register.error
 @bulk_remove.error
 
