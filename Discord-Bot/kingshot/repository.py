@@ -215,6 +215,22 @@ class JsonRepository:
                 self._save_json(self.users_path, users)
             return {"added": added, "existing": existing}
 
+    async def set_withdrawn(self, player_id: str, withdrawn: bool) -> str:
+        """Admin-only state transition; retain existing redemption history."""
+        async with self._lock:
+            payload = self._load_json(self.players_path, {"schemaVersion": 1, "players": {}})
+            player = payload.get("players", {}).get(str(player_id))
+            if not isinstance(player, dict):
+                return "not_found"
+            if bool(player.get("withdrawn", False)) == withdrawn:
+                return "unchanged"
+            player["withdrawn"] = withdrawn
+            player["autoRedeem"] = not withdrawn
+            player["updatedAt"] = utc_now_iso()
+            player["withdrawnAt"] = utc_now_iso() if withdrawn else None
+            self._save_json(self.players_path, payload)
+            return "changed"
+
     async def bulk_remove(self, player_ids: list[str]) -> dict[str, list[str]]:
         """Admin-only caller. Delete players and unlink from their real Discord owners."""
         async with self._lock:
@@ -313,6 +329,8 @@ class JsonRepository:
 
             if player:
 
+                if enabled and player.get("withdrawn", False):
+                    raise ValueError("Withdrawn player requires admin /reactivate")
                 player["autoRedeem"] = enabled
 
                 player["updatedAt"] = utc_now_iso()
@@ -329,7 +347,7 @@ class JsonRepository:
 
             records = list(players.get("players", {}).values())
 
-            return [player for player in records if player.get("autoRedeem", True)]
+            return [player for player in records if player.get("autoRedeem", True) and not player.get("withdrawn", False)]
 
 
 
