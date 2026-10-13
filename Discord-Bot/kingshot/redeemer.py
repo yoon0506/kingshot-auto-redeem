@@ -5,6 +5,7 @@ import logging
 import random
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 
 
@@ -413,13 +414,34 @@ class AutoRedeemer:
 
 
 
-    @staticmethod
-
-    def _codes_for_player(player: dict, active_codes: list[str]) -> list[str]:
-
+    def _codes_for_player(self, player: dict, active_codes: list[str]) -> list[str]:
         redeemed_codes = {item.get("code") for item in player.get("redeemedCodes", [])}
+        failed_codes = player.get("failedCodes") or {}
+        eligible = []
+        for code in active_codes:
+            if code in redeemed_codes:
+                continue
+            failure = failed_codes.get(code)
+            if isinstance(failure, dict) and self._is_timeout_retry(failure.get("message")):
+                try:
+                    last_failed = datetime.fromisoformat(str(failure.get("lastFailedAt", "")))
+                    if last_failed.tzinfo is None:
+                        last_failed = last_failed.replace(tzinfo=timezone.utc)
+                    attempts = max(1, int(failure.get("attempts", 1)))
+                    base = max(60, int(self.config.get("timeout_retry_cooldown_seconds", 600)))
+                    cap = max(base, int(self.config.get("timeout_retry_max_cooldown_seconds", 3600)))
+                    cooldown = min(cap, base * (2 ** min(attempts - 1, 10)))
+                    if (datetime.now(timezone.utc) - last_failed).total_seconds() < cooldown:
+                        continue
+                except (TypeError, ValueError, OverflowError):
+                    # Invalid timestamp: fall back to the prior retry behavior.
+                    pass
+            eligible.append(code)
+        return eligible
 
-        return [code for code in active_codes if code not in redeemed_codes]
+    @staticmethod
+    def _is_timeout_retry(message: object) -> bool:
+        return "TIMEOUT RETRY" in str(message or "").upper()
 
 
 
@@ -572,6 +594,14 @@ class AutoRedeemer:
             message=result["message"],
 
         )
+
+        if self._is_timeout_retry(result.get("message")):
+            logger.warning(
+                "Timeout response for player %s, code %s: %s. "
+                "Saved for deferred retry; continuing with other players at the normal interval.",
+                player_id, code, result.get("message"),
+            )
+            return "failed"
 
         logger.warning(
 
