@@ -184,6 +184,8 @@ class KingshotBot(discord.Client):
 
    
     async def setup_hook(self) -> None:
+        migrated = await self.repository.backfill_missing_alliances()
+        logger.info("DMD alliance migration: assigned %d legacy player(s) to DMD (0)", migrated)
         commands = await self.tree.sync()
         logger.info(
             "Synced %d global commands: %s",
