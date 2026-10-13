@@ -788,7 +788,7 @@ async def register(interaction: discord.Interaction, player_id: str) -> None:
 
         content="UID saved for Kingdom 1850 (not yet verified). Auto redeem is enabled; actual eligibility is checked on redemption.",
 
-        embed=build_player_embed(record, title_prefix="Registered"),
+        embed=build_player_embed(record, alliance_names=await bot.repository.list_alliances()),
 
         ephemeral=True,
 
@@ -1166,7 +1166,7 @@ async def list_players(interaction: discord.Interaction) -> None:
 
         content=f"Your registered players: `{len(players)}`",
 
-        embeds=build_player_embeds(players, mode="compact"),
+        embeds=build_player_embeds(players, mode="compact", alliance_names=await bot.repository.list_alliances()),
 
         ephemeral=True,
 
@@ -1215,7 +1215,7 @@ async def list_all_players(interaction: discord.Interaction) -> None:
                          for p in page
                      )),
 
-            embeds=build_player_embeds(page, mode="compact"),
+            embeds=build_player_embeds(page, mode="compact", alliance_names=alliance_names),
 
             ephemeral=True,
 
@@ -1345,7 +1345,7 @@ async def status(interaction: discord.Interaction, player_id: str) -> None:
 
     await interaction.response.send_message(
 
-        embed=build_player_embed(player, mode="expanded", title_prefix="Status"),
+        embed=build_player_embed(player, mode="expanded", alliance_names=await bot.repository.list_alliances()),
 
         ephemeral=True,
 
