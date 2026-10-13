@@ -22,6 +22,21 @@ class ReportStore:
         self.message_path = repository.root / 'data' / 'dmd_report_messages.json'
         self.expiry_path = repository.root / 'data' / 'dmd_code_expiries.json'
 
+    def source_snapshot(self) -> tuple[tuple[str, int, int], ...]:
+        """Cheap metadata snapshot for polling; no UID or token data included."""
+        paths = (
+            self.repo.players_path, self.repo.logs_path, self.repo.codes_path,
+            self.expiry_path, self.message_path,
+        )
+        result = []
+        for path in paths:
+            try:
+                st = path.stat()
+                result.append((str(path), st.st_mtime_ns, st.st_size))
+            except FileNotFoundError:
+                result.append((str(path), -1, -1))
+        return tuple(result)
+
     def recent_codes(self, *, hours: int = 48) -> list[str]:
         try:
             contents = json.loads(self.repo.codes_path.read_text(encoding='utf-8'))
