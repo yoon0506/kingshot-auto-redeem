@@ -314,9 +314,21 @@ class KingshotBot(discord.Client):
             name = " ".join(name.split())[:80]
             if uid not in names or name:
                 names[uid] = name or names.get(uid, "")
+            # Apps Script deployments may send numeric allianceId or a
+            # human-readable alliance string. Accept both without treating a
+            # missing/unknown value as OTHER: old form rows must not overwrite
+            # an existing player's alliance.
             alliance_id = player.get("allianceId")
             if type(alliance_id) is int and alliance_id in (0, 1, 2, 3):
                 alliances[uid] = alliance_id
+            else:
+                raw_alliance = str(player.get("alliance") or "").strip().upper()
+                alliance_from_name = {
+                    "DMD": 0, "MVP": 1, "HEX": 2,
+                    "OTHER": 3, "ETC": 3, "기타": 3, "기타/ETC": 3,
+                }.get(raw_alliance)
+                if alliance_from_name is not None:
+                    alliances[uid] = alliance_from_name
 
         if not names:
             logger.info("DMD form sync: no valid UIDs (invalid=%d)", invalid_count)
