@@ -234,8 +234,7 @@ class JsonRepository:
             return "changed", old
 
     # Alliance identities are stable numeric IDs; names are editable labels.
-    # Existing records without allianceId are displayed as OTHER (3), and
-    # the stored player record is never altered during this lookup.
+    # Legacy records without allianceId are migrated to DMD (0) on startup.
     DEFAULT_ALLIANCES = {0: "DMD", 1: "MVP", 2: "HEX", 3: "OTHER"}
 
     async def list_alliances(self) -> dict[int, str]:
@@ -298,6 +297,26 @@ class JsonRepository:
             names[str(alliance_id)] = name
             self._save_json(self.alliances_path, data)
             return "changed", previous
+
+    async def backfill_missing_alliances(self) -> int:
+        """Assign DMD (0) only to legacy records with no alliance assignment.
+
+        Existing explicit MVP/HEX/OTHER assignments remain untouched. The
+        assignment is not an admin override, so a new Google Form selection
+        may update it later. Safe to call repeatedly on startup.
+        """
+        async with self._lock:
+            data = self._load_json(self.players_path, {"schemaVersion": 1, "players": {}})
+            records = data.get("players", {})
+            changed = 0
+            for record in records.values():
+                if isinstance(record, dict) and record.get("allianceId") is None:
+                    record["allianceId"] = 0
+                    record["updatedAt"] = utc_now_iso()
+                    changed += 1
+            if changed:
+                self._save_json(self.players_path, data)
+            return changed
 
     async def update_form_alliances(self, alliances: dict[str, int]) -> int:
         """Sync form-selected alliance IDs, preserving explicit admin overrides.
