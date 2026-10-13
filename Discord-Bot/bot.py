@@ -380,12 +380,13 @@ class KingshotBot(discord.Client):
                 return "Report unchanged."
 
             finished = stats['total'] - stats['pending']
+            # Display redemption progress independently of unknown expiry dates.
             if expired:
                 label = "🔴 만료"
-            elif expiry is not None:
-                label = "🟢 진행 중"
+            elif stats['pending'] == 0 and stats['failed'] == 0:
+                label = "✅ 처리 완료"
             else:
-                label = "⚪ 만료 여부 미확인"
+                label = "🟢 진행 중"
 
             # Don't show an update frequency on archived expired reports.
             progress = f"왕국 1850 · 진행 {finished}/{stats['total']}명"
