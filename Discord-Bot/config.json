@@ -26,8 +26,8 @@
   "auto_redeem": {
     "enabled": true,
     "poll_interval_seconds": 3600, 
-    "min_delay_seconds": 20,
-    "max_delay_seconds": 45,
+    "min_delay_seconds": 10,
+    "max_delay_seconds": 20,
     "batch_pause_min_seconds": 60,
     "batch_pause_max_seconds": 120,
     "failure_cooldown_seconds": 180,
