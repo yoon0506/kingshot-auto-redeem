@@ -1,5 +1,6 @@
 import asyncio
 import json
+import hashlib
 
 import logging
 
@@ -143,6 +144,9 @@ class KingshotBot(discord.Client):
         self._report_lock = asyncio.Lock()
         self._form_sync_url = os.getenv("DMD_SYNC_URL", "").strip()
         self._form_sync_key = os.getenv("DMD_SYNC_KEY", "").strip()
+        # Memory-only caches: safe to rebuild after a restart.
+        self._form_last_digest: str | None = None
+        self._report_last_snapshot: tuple | None = None
 
 
 
@@ -264,6 +268,14 @@ class KingshotBot(discord.Client):
             logger.info("DMD form sync: no valid UIDs (invalid=%d)", invalid_count)
             return
 
+        # Do not write existing players to disk on every poll.
+        # Use the validated UID set rather than the raw JSON response so
+        # harmless differences in row formatting do not trigger work.
+        digest = hashlib.sha256("\n".join(sorted(ids)).encode("ascii")).hexdigest()
+        if digest == self._form_last_digest:
+            logger.debug("DMD form sync: no UID changes; registration skipped")
+            return
+
         # Work in batches to avoid large write operations on the free host.
         added_count = 0
         existing_count = 0
@@ -281,6 +293,7 @@ class KingshotBot(discord.Client):
         except Exception:
             logger.exception("DMD form sync failed while saving players")
             return
+        self._form_last_digest = digest  # Only advance after successful persistence.
         logger.info(
             "DMD form sync finished: added=%d existing=%d invalid=%d",
             added_count, existing_count, invalid_count,
@@ -289,8 +302,22 @@ class KingshotBot(discord.Client):
     @tasks.loop(minutes=5)
     async def report_loop(self) -> None:
         await self.wait_until_ready()
+        # The active reports depend on the players, redeemed/failed events,
+        # code-cache/expiry metadata and message ID store. Check those file
+        # fingerprints first to avoid re-reading and aggregating each player.
+        snapshot = self.report_store.source_snapshot()
+        if snapshot == self._report_last_snapshot:
+            logger.debug("DMD report: inputs unchanged; aggregation skipped")
+            return
+        successful = True
         for code in self.report_store.recent_codes():
-            await self.publish_redeem_report(code)
+            result = await self.publish_redeem_report(code)
+            if result not in ("Report unchanged.", f"Report posted/updated for {code}."):
+                successful = False
+        # Recheck after updating the report message-ID store ourselves.
+        # On transient Discord failures don't suppress the next retry.
+        if successful:
+            self._report_last_snapshot = self.report_store.source_snapshot()
 
     async def publish_redeem_report(self, code: str, *, force: bool = False) -> str:
         """Maintain a single private-channel message per code across restarts."""
