@@ -173,6 +173,11 @@ class KingshotBot(discord.Client):
         # Memory-only caches: safe to rebuild after a restart.
         self._form_last_digest: str | None = None
         self._report_last_snapshot: tuple | None = None
+        self._health_form_ok: datetime | None = None
+        self._health_redeem_ok: datetime | None = None
+        self._health_redeem_error: str | None = None
+        self._health_lock = asyncio.Lock()
+        self._health_file = ROOT / "data" / "dmd_health_message.json"
 
 
 
@@ -200,7 +205,9 @@ class KingshotBot(discord.Client):
 
         if self.report_channel_id:
             self.report_loop.start()
+            self.health_loop.start()
             logger.info("DMD redemption reports enabled (interval: 5 minutes)")
+            logger.info("DMD healthcheck enabled (interval: 60 minutes)")
         else:
             logger.info("DMD redemption reports disabled: DMD_REPORT_CHANNEL_ID missing")
 
@@ -208,7 +215,8 @@ class KingshotBot(discord.Client):
 
 
     async def close(self) -> None:
-
+        if self.health_loop.is_running():
+            self.health_loop.cancel()
         if self.report_loop.is_running():
             self.report_loop.cancel()
         if self.form_sync_loop.is_running():
@@ -222,13 +230,23 @@ class KingshotBot(discord.Client):
 
 
 
+    async def run_redeem_checked(self) -> dict[str, int]:
+        try:
+            stats = await self.redeemer.run_once()
+        except Exception as exc:
+            self._health_redeem_error = type(exc).__name__
+            raise
+        self._health_redeem_ok = datetime.now(timezone.utc)
+        self._health_redeem_error = None
+        return stats
+
     @tasks.loop(seconds=300)
 
     async def auto_redeem_loop(self) -> None:
 
         await self.wait_until_ready()
 
-        await self.redeemer.run_once()
+        await self.run_redeem_checked()
 
 
 
@@ -302,6 +320,7 @@ class KingshotBot(discord.Client):
         normalized = json.dumps(sorted(names.items()), ensure_ascii=False, separators=(",", ":"))
         digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         if digest == self._form_last_digest:
+            self._health_form_ok = datetime.now(timezone.utc)
             logger.debug("DMD form sync: UID/nickname inputs unchanged; skipped")
             return
 
@@ -328,6 +347,7 @@ class KingshotBot(discord.Client):
             return
 
         self._form_last_digest = digest
+        self._health_form_ok = datetime.now(timezone.utc)
         logger.info(
             "DMD form sync finished: added=%d existing=%d renamed=%d invalid=%d",
             added_count, existing_count, changed_names, invalid_count,
@@ -352,6 +372,85 @@ class KingshotBot(discord.Client):
         # On transient Discord failures don't suppress the next retry.
         if successful:
             self._report_last_snapshot = self.report_store.source_snapshot()
+
+    @staticmethod
+    def _health_age(value: datetime | None) -> str:
+        if value is None:
+            return "아직 성공 확인 없음 (재시작 이후)"
+        seconds = max(0, int((datetime.now(timezone.utc) - value).total_seconds()))
+        return f"{seconds // 60}분 전" if seconds < 86400 else f"{seconds // 3600}시간 전"
+
+    async def health_embed(self) -> discord.Embed:
+        # Read-only data: neither credentials nor individual UIDs are included.
+        players = await self.repository.list_all_players()
+        active = sum(bool(p.get("autoRedeem", True)) and not p.get("withdrawn", False) for p in players)
+        withdrawn = sum(bool(p.get("withdrawn", False)) for p in players)
+        now = datetime.now(timezone.utc)
+        form_age = ((now - self._health_form_ok).total_seconds() if self._health_form_ok else None)
+        redeem_age = ((now - self._health_redeem_ok).total_seconds() if self._health_redeem_ok else None)
+        form_ok = bool(self._form_sync_url and self._form_sync_key and self.form_sync_loop.is_running() and form_age is not None and form_age <= 900)
+        redeem_enabled = CONFIG["auto_redeem"].get("enabled", True)
+        redeem_ok = bool(redeem_enabled and self.auto_redeem_loop.is_running() and redeem_age is not None and redeem_age <= 5400 and not self._health_redeem_error)
+        status = "🟢 정상" if form_ok and redeem_ok else "🟠 확인 필요"
+        embed = discord.Embed(title="🍅 DMD Gift Bot — Healthcheck", description=f"**상태: {status}**\n왕국 1850 · 자동 상태 보고 (1시간)", color=discord.Color.green() if form_ok and redeem_ok else discord.Color.orange())
+        embed.add_field(name="👥 전체 UID", value=str(len(players)), inline=True)
+        embed.add_field(name="✅ 자동 수령 ON", value=str(active), inline=True)
+        embed.add_field(name="⏸️ 수령 OFF", value=str(len(players)-active), inline=True)
+        embed.add_field(name="🚫 철회", value=str(withdrawn), inline=True)
+        embed.add_field(name="📋 구글폼 동기화", value=f"{'✅' if form_ok else '⚠️'} {self._health_age(self._health_form_ok)}", inline=False)
+        embed.add_field(name="🎁 쿠폰 검사 사이클", value=f"{'✅' if redeem_ok else '⚠️'} {self._health_age(self._health_redeem_ok)}", inline=False)
+        if self._health_redeem_error:
+            embed.add_field(name="⚠️ 최근 쿠폰 처리 오류", value=self._health_redeem_error, inline=False)
+        embed.set_footer(text="봇 프로세스 내부 확인 기준 · 외부 장애 감시는 별도로 필요")
+        return embed
+
+    async def publish_health(self, *, force: bool = False) -> str:
+        if not self.report_channel_id:
+            return "리포트 채널 미설정"
+        async with self._health_lock:
+            embed = await self.health_embed()
+            channel = self.get_channel(self.report_channel_id)
+            if channel is None:
+                try:
+                    channel = await self.fetch_channel(self.report_channel_id)
+                except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+                    return "헬스체크 채널 접근 실패"
+            if not hasattr(channel, "send") or not hasattr(channel, "fetch_message"):
+                return "텍스트 채널이 필요합니다"
+            message_id = None
+            try:
+                data = json.loads(self._health_file.read_text(encoding="utf-8"))
+                message_id = int(data.get("message_id", 0))
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+            msg = None
+            if message_id:
+                try:
+                    msg = await channel.fetch_message(message_id)
+                    await msg.edit(embed=embed)
+                except discord.NotFound:
+                    msg = None
+                except (discord.Forbidden, discord.HTTPException):
+                    return "기존 헬스체크 메시지 수정 실패"
+            if msg is None:
+                try:
+                    msg = await channel.send(embed=embed)
+                except (discord.Forbidden, discord.HTTPException):
+                    return "헬스체크 메시지 전송 실패"
+            self._health_file.parent.mkdir(parents=True, exist_ok=True)
+            temp = self._health_file.with_suffix(".tmp")
+            temp.write_text(json.dumps({"message_id": msg.id}), encoding="utf-8")
+            os.replace(temp, self._health_file)
+            return "헬스체크 리포트 갱신 완료"
+
+    @tasks.loop(hours=1)
+    async def health_loop(self) -> None:
+        await self.wait_until_ready()
+        # Delay first automatic publication until routine checks have started.
+        await asyncio.sleep(90)
+        result = await self.publish_health()
+        if result != "헬스체크 리포트 갱신 완료":
+            logger.warning("DMD healthcheck: %s", result)
 
     async def publish_redeem_report(self, code: str, *, force: bool = False) -> str:
         """Maintain a single private-channel message per code across restarts."""
@@ -476,7 +575,7 @@ class KingshotBot(discord.Client):
 
         logger.info("Auto redeem wake requested: %s", reason)
 
-        task = asyncio.create_task(self.redeemer.run_once())
+        task = asyncio.create_task(self.run_redeem_checked())
 
         task.add_done_callback(self._log_auto_redeem_wake_result)
 
@@ -941,6 +1040,16 @@ async def edit_ment(interaction: discord.Interaction, ment: str) -> None:
     )
 
 
+@bot.tree.command(name="healthcheck", description="DMD admins: show or update the bot health report.")
+async def healthcheck(interaction: discord.Interaction) -> None:
+    if not _is_admin(interaction.user.id):
+        await interaction.response.send_message("DMD admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await bot.publish_health(force=True)
+    await interaction.followup.send(result, ephemeral=True)
+
+
 @bot.tree.command(name="list", description="List your registered Kingshot players.")
 
 @app_commands.checks.cooldown(1, CONFIG["limits"]["command_cooldown_seconds"], key=lambda i: i.user.id)
@@ -1145,6 +1254,7 @@ async def status(interaction: discord.Interaction, player_id: str) -> None:
 
 
 
+@healthcheck.error
 @register.error
 @redeem_code.error
 @redeem_report.error
