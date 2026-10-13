@@ -45,6 +45,7 @@ class JsonRepository:
         self.codes_path = self._path(storage_config["codes_file"])
 
         self.logs_path = self._path(storage_config["logs_file"])
+        self.alliances_path = self.root / "data" / "alliances.json"
 
         self._lock = asyncio.Lock()
 
@@ -231,6 +232,96 @@ class JsonRepository:
             player["updatedAt"] = utc_now_iso()
             self._save_json(self.players_path, data)
             return "changed", old
+
+    # Alliance identities are stable numeric IDs; names are editable labels.
+    # Existing records without allianceId are displayed as OTHER (3), and
+    # the stored player record is never altered during this lookup.
+    DEFAULT_ALLIANCES = {0: "DMD", 1: "MVP", 2: "HEX", 3: "OTHER"}
+
+    async def list_alliances(self) -> dict[int, str]:
+        async with self._lock:
+            data = self._load_json(self.alliances_path, {"schemaVersion": 1, "alliances": {}})
+            result = dict(self.DEFAULT_ALLIANCES)
+            if isinstance(data, dict) and isinstance(data.get("alliances"), dict):
+                for key, name in data["alliances"].items():
+                    if str(key).isdecimal() and int(key) in result and isinstance(name, str) and name.strip():
+                        result[int(key)] = name.strip()
+            return result
+
+    async def set_alliance(self, player_id: str, alliance_id: int) -> tuple[str, int]:
+        if alliance_id not in self.DEFAULT_ALLIANCES:
+            raise ValueError("Invalid alliance ID")
+        async with self._lock:
+            data = self._load_json(self.players_path, {"schemaVersion": 1, "players": {}})
+            player = data.get("players", {}).get(str(player_id))
+            if not isinstance(player, dict):
+                return "not_found", 3
+            old = player.get("allianceId", 3)
+            try:
+                old = int(old)
+            except (TypeError, ValueError):
+                old = 3
+            if old == alliance_id and player.get("allianceId") == alliance_id:
+                # An explicit admin assignment takes precedence over future form syncs.
+                if not player.get("allianceAdminOverride", False):
+                    player["allianceAdminOverride"] = True
+                    player["updatedAt"] = utc_now_iso()
+                    self._save_json(self.players_path, data)
+                return "unchanged", old
+            player["allianceId"] = alliance_id
+            player["allianceAdminOverride"] = True
+            player["updatedAt"] = utc_now_iso()
+            self._save_json(self.players_path, data)
+            return "changed", old
+
+    async def rename_alliance(self, alliance_id: int, name: str) -> tuple[str, str]:
+        if alliance_id not in self.DEFAULT_ALLIANCES:
+            raise ValueError("Invalid alliance ID")
+        name = name.strip()
+        if not (1 <= len(name) <= 32) or any(ord(c) < 32 for c in name):
+            raise ValueError("Alliance name must be 1-32 characters, without control characters")
+        async with self._lock:
+            data = self._load_json(self.alliances_path, {"schemaVersion": 1, "alliances": {}})
+            if not isinstance(data, dict):
+                data = {"schemaVersion": 1, "alliances": {}}
+            names = data.setdefault("alliances", {})
+            if not isinstance(names, dict):
+                names = {}
+                data["alliances"] = names
+            previous = str(names.get(str(alliance_id), self.DEFAULT_ALLIANCES[alliance_id]))
+            if previous == name:
+                return "unchanged", previous
+            # Names must remain unambiguous across the four IDs.
+            current = {idx: str(names.get(str(idx), default)) for idx, default in self.DEFAULT_ALLIANCES.items()}
+            if any(idx != alliance_id and other.casefold() == name.casefold() for idx, other in current.items()):
+                return "duplicate", previous
+            names[str(alliance_id)] = name
+            self._save_json(self.alliances_path, data)
+            return "changed", previous
+
+    async def update_form_alliances(self, alliances: dict[str, int]) -> int:
+        """Sync form-selected alliance IDs, preserving explicit admin overrides.
+
+        Only existing records are edited. The Google Form must never change
+        kingdom, ownership, withdrawal state or redemption history.
+        """
+        async with self._lock:
+            data = self._load_json(self.players_path, {"schemaVersion": 1, "players": {}})
+            records = data.get("players", {})
+            changed = 0
+            for uid, alliance_id in alliances.items():
+                if type(alliance_id) is not int or alliance_id not in self.DEFAULT_ALLIANCES:
+                    continue
+                record = records.get(str(uid))
+                if not isinstance(record, dict) or record.get("allianceAdminOverride", False):
+                    continue
+                if record.get("allianceId") != alliance_id:
+                    record["allianceId"] = alliance_id
+                    record["updatedAt"] = utc_now_iso()
+                    changed += 1
+            if changed:
+                self._save_json(self.players_path, data)
+            return changed
 
     async def set_withdrawn(self, player_id: str, withdrawn: bool) -> str:
         """Admin-only state transition; retain existing redemption history."""
