@@ -1048,13 +1048,16 @@ async def redeem_code(interaction: discord.Interaction, code: str) -> None:
         )
         return
 
+    manual_probe = await bot.redeemer.manual_retry_code(code)
     await bot.repository.log_event(
-        "manual_code_queued", discordUserId=str(interaction.user.id), code=code
+        "manual_code_queued", discordUserId=str(interaction.user.id), code=code,
+        safetyProbe=manual_probe,
     )
     bot.wake_auto_redeem(f"admin queued code {code}")
     await interaction.response.send_message(
-        f"Queued `{code}` for all registered accounts with auto-redeem enabled. "
-        "This does not guarantee a successful claim; check the hosting logs.",
+        (f"Queued `{code}` for a one-player safety probe; if accepted, normal redemption resumes. "
+         if manual_probe else f"Queued `{code}` for all registered accounts with auto-redeem enabled. ")
+        + "This does not guarantee a successful claim; check the hosting logs.",
         ephemeral=True,
     )
 
