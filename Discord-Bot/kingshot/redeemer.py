@@ -4,9 +4,12 @@ import logging
 
 import random
 import time
+import json
+import os
+import tempfile
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 
 
@@ -47,6 +50,7 @@ class AutoRedeemer:
         self.config = config
 
         self._run_lock = asyncio.Lock()
+        self._code_safety_file = self.repository.codes_path.parent / "dmd_code_safety.json"
 
 
 
@@ -106,6 +110,49 @@ class AutoRedeemer:
             logger.info("No redeemable active gift codes found after filtering unredeemable codes")
 
             return stats
+
+        # Persistent state machine: initial three-error pause, one limited probe,
+        # then permanent automatic block if the SAME error occurs again.
+        safety_states = self._load_safety_states()
+        if not self._code_safety_file.exists():
+            legacy = await self._recent_problem_codes(active_codes)
+            for code, (message, until) in legacy.items():
+                safety_states[code] = {"status": "cooldown", "reason": message,
+                                       "until": until.isoformat()}
+            self._save_safety_states(safety_states)
+        now = datetime.now(timezone.utc)
+        probe_codes: set[str] = set()
+        blocked_codes = []
+        for code in active_codes:
+            state = safety_states.get(code, {})
+            status = state.get("status")
+            if status == "blocked":
+                blocked_codes.append(code)
+                logger.warning("DMD CODE SAFETY: code %s permanently blocked for automatic redemption; admin /redeemcode may probe again", code)
+            elif status == "cooldown":
+                try:
+                    until = datetime.fromisoformat(state["until"])
+                    if until.tzinfo is None:
+                        until = until.replace(tzinfo=timezone.utc)
+                except (ValueError, KeyError, TypeError):
+                    until = now
+                if now < until:
+                    blocked_codes.append(code)
+                    logger.warning("DMD CODE SAFETY: code %s paused until %s UTC", code, until.isoformat())
+                else:
+                    probe_codes.add(code)
+                    logger.warning("DMD CODE SAFETY: code %s cooldown finished; probing one player only", code)
+            elif status == "probe":
+                probe_codes.add(code)
+                logger.warning("DMD CODE SAFETY: manually retrying code %s with one-player probe", code)
+        active_codes = [code for code in active_codes if code not in blocked_codes]
+        if not active_codes:
+            logger.warning("DMD CODE SAFETY: All available codes are blocked or cooling down; no requests sent.")
+            return stats
+
+        # Consecutive identical errors per code in THIS cycle. Successful
+        # responses reset the streak. Only 3 distinct UIDs trigger a pause.
+        error_streaks: dict[str, tuple[str, set[str]]] = {}
 
 
 
@@ -191,12 +238,64 @@ class AutoRedeemer:
             result = await self._redeem_for_player(job.player, job.code)
 
             stats[result] += 1
-            if result == "failed":
+            was_probe = job.code in probe_codes
+            if was_probe:
+                updated_probe = await self.repository.get_player(pair[0])
+                probe_entry = ((updated_probe or {}).get("failedCodes") or {}).get(job.code, {})
+                probe_message = probe_entry.get("message", "") if isinstance(probe_entry, dict) else ""
+                previous_reason = str(safety_states.get(job.code, {}).get("reason", ""))
+                if result in ("success", "already"):
+                    safety_states.pop(job.code, None)
+                    logger.info("DMD CODE SAFETY: code %s probe succeeded; normal automatic processing restored", job.code)
+                elif result == "failed" and self._code_problem_error(probe_message) == previous_reason:
+                    safety_states[job.code] = {"status": "blocked", "reason": previous_reason,
+                                               "blockedAt": datetime.now(timezone.utc).isoformat()}
+                    logger.error("DMD CODE SAFETY: code %s permanently blocked after repeat '%s'; admin /redeemcode can override", job.code, previous_reason)
+                    active_codes = [c for c in active_codes if c != job.code]
+                else:
+                    # Transient or different error is inconclusive; do not permanently block.
+                    until = datetime.now(timezone.utc) + timedelta(minutes=max(5, int(self.config.get("code_error_pause_minutes", 60))))
+                    safety_states[job.code] = {"status": "cooldown", "reason": previous_reason,
+                                               "until": until.isoformat()}
+                    logger.warning("DMD CODE SAFETY: code %s inconclusive probe (%s); paused again until %s", job.code, result, until.isoformat())
+                    active_codes = [c for c in active_codes if c != job.code]
+                self._save_safety_states(safety_states)
+                probe_codes.discard(job.code)
+                error_streaks.pop(job.code, None)
+            elif result in ("success", "already"):
+                error_streaks.pop(job.code, None)
+            if result == "failed" and not was_probe:
                 updated = await self.repository.get_player(pair[0])
                 error = ((updated or {}).get("failedCodes") or {}).get(job.code, {})
-                if isinstance(error, dict) and self._is_timeout_retry(error.get("message")):
+                message = error.get("message") if isinstance(error, dict) else None
+                if self._is_timeout_retry(message):
+                    error_streaks.pop(job.code, None)
                     timeout_retries.append((pair[0], job.code, time.monotonic()))
                     logger.info("Deferred timeout job to end of cycle: player %s, code %s", pair[0], job.code)
+                else:
+                    problem = self._code_problem_error(message)
+                    if problem:
+                        prior_problem, affected = error_streaks.get(job.code, (problem, set()))
+                        if prior_problem != problem:
+                            affected = set()
+                        affected.add(pair[0])
+                        error_streaks[job.code] = (problem, affected)
+                        if len(affected) >= max(2, int(self.config.get("code_error_stop_threshold", 3))):
+                            logger.error(
+                                "DMD CODE SAFETY TRIGGERED: code %s returned '%s' for %s distinct "
+                                "players in a row. Suspending this code for the current cycle; "
+                                "persisted failures will suppress it for %s minutes after restart. "
+                                "Other codes continue.",
+                                job.code, problem, len(affected),
+                                max(5, int(self.config.get("code_error_pause_minutes", 60))),
+                            )
+                            active_codes = [c for c in active_codes if c != job.code]
+                            until = datetime.now(timezone.utc) + timedelta(minutes=max(5, int(self.config.get("code_error_pause_minutes", 60))))
+                            safety_states[job.code] = {"status": "cooldown", "reason": problem,
+                                                       "until": until.isoformat()}
+                            self._save_safety_states(safety_states)
+                    else:
+                        error_streaks.pop(job.code, None)
 
             logger.info(
 
@@ -225,12 +324,17 @@ class AutoRedeemer:
 
 
             if result == "rate_limited":
+                error_streaks.pop(job.code, None)
 
                 attempts = rate_limit_attempts.get(pair, 0) + 1
 
                 rate_limit_attempts[pair] = attempts
 
-                if attempts < self.config.get("max_rate_limit_retries_per_cycle", 3):
+                if job.code not in safety_states or safety_states.get(job.code, {}).get("status") not in {"cooldown", "blocked"}:
+                    may_retry_rate_limit = True
+                else:
+                    may_retry_rate_limit = False
+                if may_retry_rate_limit and attempts < self.config.get("max_rate_limit_retries_per_cycle", 3):
 
                     attempted_pairs.discard(pair)
 
@@ -497,6 +601,90 @@ class AutoRedeemer:
     @staticmethod
     def _is_timeout_retry(message: object) -> bool:
         return "TIMEOUT RETRY" in str(message or "").upper()
+
+    @staticmethod
+    def _code_problem_error(message: object) -> str | None:
+        """Only recognize repeated, code-level application rejections.
+
+        Do not infer a bad code from UID errors, timeouts, rate limiting, or
+        HTTP/network errors. Unknown messages should be reviewed explicitly.
+        """
+        normalized = str(message or "").upper().strip().rstrip(".")
+        # RECHARGE_MONEY ERROR appeared across several different 1850 UIDs
+        # for VIP1017. It does NOT prove the code is globally invalid.
+        return normalized if normalized in {"RECHARGE_MONEY ERROR"} else None
+
+    def _load_safety_states(self) -> dict:
+        try:
+            with self._code_safety_file.open(encoding="utf-8") as file:
+                payload = json.load(file)
+            codes = payload.get("codes") if isinstance(payload, dict) else None
+            return codes if isinstance(codes, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_safety_states(self, codes: dict) -> None:
+        path = self._code_safety_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"schemaVersion": 1, "codes": codes}, handle, ensure_ascii=False, indent=2)
+            os.replace(temp, path)
+        except Exception:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+            raise
+
+    async def manual_retry_code(self, code: str) -> bool:
+        """Admin action: permit one probe for a paused/blocked code, never reset redeemed history."""
+        states = self._load_safety_states()
+        prior = states.get(code)
+        if not isinstance(prior, dict) or prior.get("status") not in {"blocked", "cooldown", "probe"}:
+            return False
+        states[code] = {"status": "probe", "reason": str(prior.get("reason", "")),
+                        "requestedAt": datetime.now(timezone.utc).isoformat()}
+        self._save_safety_states(states)
+        logger.warning("DMD CODE SAFETY: administrator requested one-player probe for code %s", code)
+        return True
+
+    async def _recent_problem_codes(self, codes: list[str]) -> dict[str, tuple[str, datetime]]:
+        """Reconstruct temporary pauses from durable failedCodes timestamps.
+
+        No additional state file and no permanent expiry flag. When the third
+        distinct player's failure becomes 60 minutes old, this code can be
+        tested again. The previous attempts survive process restarts.
+        """
+        threshold = max(2, int(self.config.get("code_error_stop_threshold", 3)))
+        pause = timedelta(minutes=max(5, int(self.config.get("code_error_pause_minutes", 60))))
+        now = datetime.now(timezone.utc)
+        entries: dict[tuple[str, str], list[datetime]] = {}
+        for player in await self.repository.list_all_players():
+            for code, failure in (player.get("failedCodes") or {}).items():
+                if code not in codes or not isinstance(failure, dict):
+                    continue
+                problem = self._code_problem_error(failure.get("message"))
+                if not problem:
+                    continue
+                try:
+                    recorded = datetime.fromisoformat(str(failure.get("lastFailedAt", "")))
+                    if recorded.tzinfo is None:
+                        recorded = recorded.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    continue
+                if recorded <= now and now - recorded < pause:
+                    entries.setdefault((code, problem), []).append(recorded)
+        blocked: dict[str, tuple[str, datetime]] = {}
+        for (code, problem), times in entries.items():
+            if len(times) >= threshold:
+                # Third newest failure must expire before unpausing.
+                times.sort(reverse=True)
+                until = times[threshold - 1] + pause
+                if until > now and (code not in blocked or until > blocked[code][1]):
+                    blocked[code] = (problem, until)
+        return blocked
 
 
 
