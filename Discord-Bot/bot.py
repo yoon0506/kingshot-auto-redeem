@@ -978,15 +978,16 @@ async def reactivate(interaction: discord.Interaction, uid: str) -> None:
     if not (uid.isascii() and uid.isdigit() and 5 <= len(uid) <= 15):
         await interaction.response.send_message("UID must contain 5–15 ASCII digits.", ephemeral=True)
         return
+    review_status = await bot.repository.clear_uid_quarantine(uid)
     status = await bot.repository.set_withdrawn(uid, False)
     if status == "not_found":
         await interaction.response.send_message(f"UID `{uid}` is not registered.", ephemeral=True)
         return
-    if status == "changed":
+    if status == "changed" or review_status == "changed":
         await bot.repository.log_event("admin_player_reactivated", playerId=uid, adminDiscordUserId=str(interaction.user.id))
         bot.wake_auto_redeem(f"admin reactivated player {uid}")
     await interaction.response.send_message(
-        f"🍅 UID `{uid}`: " + ("reactivated. Auto redeem ON; history preserved." if status == "changed" else "not withdrawn; no change."),
+        f"🍅 UID `{uid}`: " + ("reactivated. Auto redeem ON; history preserved." if status == "changed" or review_status == "changed" else "not withdrawn; no change."),
         ephemeral=True,
     )
 
