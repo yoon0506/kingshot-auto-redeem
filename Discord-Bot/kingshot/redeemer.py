@@ -3,6 +3,7 @@ import asyncio
 import logging
 
 import random
+import time
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -111,6 +112,7 @@ class AutoRedeemer:
         attempted_pairs: set[tuple[str, str]] = set()
 
         rate_limit_attempts: dict[tuple[str, str], int] = {}
+        timeout_retries: list[tuple[str, str, float]] = []
 
         last_player_id: str | None = None
 
@@ -189,6 +191,12 @@ class AutoRedeemer:
             result = await self._redeem_for_player(job.player, job.code)
 
             stats[result] += 1
+            if result == "failed":
+                updated = await self.repository.get_player(pair[0])
+                error = ((updated or {}).get("failedCodes") or {}).get(job.code, {})
+                if isinstance(error, dict) and self._is_timeout_retry(error.get("message")):
+                    timeout_retries.append((pair[0], job.code, time.monotonic()))
+                    logger.info("Deferred timeout job to end of cycle: player %s, code %s", pair[0], job.code)
 
             logger.info(
 
@@ -289,6 +297,53 @@ class AutoRedeemer:
                 await self._delay_between_jobs()
 
 
+
+        # A second pass is only for TIMEOUT RETRY responses seen in this cycle.
+        # The per-pair records already persist through mark_failed(), so a restart
+        # is safe; any unfinished retry will be eligible in a future normal cycle.
+        retry_wait = max(60.0, float(self.config.get("same_cycle_timeout_retry_seconds", 60)))
+        if timeout_retries:
+            logger.info("Starting end-of-cycle timeout retries: %s job(s)", len(timeout_retries))
+        for index, (player_id, code, failed_at) in enumerate(timeout_retries, start=1):
+            if code not in active_codes:
+                logger.info("Skipping timeout retry for %s: code %s no longer active", player_id, code)
+                continue
+            current = await self.repository.get_player(player_id)
+            if not current or not current.get("autoRedeem", True) or current.get("withdrawn", False):
+                logger.info("Skipping timeout retry for %s: account unavailable or disabled", player_id)
+                continue
+            if any(item.get("code") == code for item in current.get("redeemedCodes", [])):
+                continue
+            remaining = retry_wait - (time.monotonic() - failed_at)
+            if remaining > 0:
+                logger.info("Timeout retry for player %s waiting %.1fs for minimum cooldown", player_id, remaining)
+                await asyncio.sleep(remaining)
+            # Re-read to avoid undoing any manual disable / successful claim while waiting.
+            current = await self.repository.get_player(player_id)
+            if not current or not current.get("autoRedeem", True) or current.get("withdrawn", False):
+                continue
+            if any(item.get("code") == code for item in current.get("redeemedCodes", [])):
+                continue
+            logger.info("Timeout retry %s/%s started: player %s, code %s", index, len(timeout_retries), player_id, code)
+            outcome = await self._redeem_for_player(current, code)
+            if outcome in ("success", "already"):
+                stats["failed"] -= 1
+                stats[outcome] += 1
+            elif outcome == "expired":
+                stats["failed"] -= 1
+                stats["expired"] += 1
+                active_codes = [c for c in active_codes if c != code]
+            elif outcome == "max_uses":
+                stats["failed"] -= 1
+                stats["max_uses"] += 1
+                active_codes = [c for c in active_codes if c != code]
+            elif outcome == "rate_limited":
+                stats["failed"] -= 1
+                stats["rate_limited"] += 1
+            # A second timeout remains one unresolved failed player, not two failures.
+            logger.info("Timeout retry %s/%s finished: %s", index, len(timeout_retries), outcome)
+            if index < len(timeout_retries):
+                await self._delay_between_jobs()
 
         await self.repository.log_event("auto_redeem_cycle_finished", **stats)
 
