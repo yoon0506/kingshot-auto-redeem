@@ -166,6 +166,7 @@ class KingshotBot(discord.Client):
 
         self.redeemer = AutoRedeemer(self.repository, self.api, CONFIG["auto_redeem"])
         self.report_store = ReportStore(self.repository)
+        self._code_safety_file = self.repository.codes_path.parent / "dmd_code_safety.json"
         self.report_channel_id = _optional_int_env("DMD_REPORT_CHANNEL_ID")
         self._report_lock = asyncio.Lock()
         self._form_sync_url = os.getenv("DMD_SYNC_URL", "").strip()
@@ -377,13 +378,37 @@ class KingshotBot(discord.Client):
             added_count, existing_count, changed_names, changed_alliances, invalid_count,
         )
 
+    def _code_safety_snapshot(self) -> tuple[int, int] | None:
+        """Track state-file changes even when redemption counters stay identical."""
+        try:
+            info = self._code_safety_file.stat()
+            return (info.st_mtime_ns, info.st_size)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            logger.warning("DMD code safety snapshot failed: %s", type(exc).__name__)
+            return None
+
+    def _code_safety_state(self, code: str) -> dict:
+        """Read-only: never alter the redeemer's code-level safety decisions."""
+        try:
+            payload = json.loads(self._code_safety_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            logger.warning("DMD code safety read failed: %s", type(exc).__name__)
+            return {}
+        states = payload.get("codes") if isinstance(payload, dict) else None
+        state = states.get(code) if isinstance(states, dict) else None
+        return state if isinstance(state, dict) else {}
+
     @tasks.loop(minutes=5)
     async def report_loop(self) -> None:
         await self.wait_until_ready()
         # The active reports depend on the players, redeemed/failed events,
         # code-cache/expiry metadata and message ID store. Check those file
         # fingerprints first to avoid re-reading and aggregating each player.
-        snapshot = self.report_store.source_snapshot()
+        snapshot = (self.report_store.source_snapshot(), self._code_safety_snapshot())
         if snapshot == self._report_last_snapshot:
             logger.debug("DMD report: inputs unchanged; aggregation skipped")
             return
@@ -395,7 +420,7 @@ class KingshotBot(discord.Client):
         # Recheck after updating the report message-ID store ourselves.
         # On transient Discord failures don't suppress the next retry.
         if successful:
-            self._report_last_snapshot = self.report_store.source_snapshot()
+            self._report_last_snapshot = (self.report_store.source_snapshot(), self._code_safety_snapshot())
 
     @staticmethod
     def _health_age(value: datetime | None) -> str:
@@ -489,6 +514,10 @@ class KingshotBot(discord.Client):
             record = saved.get(key, {})
             expiry_cutoff = detected_expiry or (expiry if expiry and now >= expiry else None)
             expired = expiry_cutoff is not None
+            safety = self._code_safety_state(code) if not expired else {}
+            safety_status = safety.get("status") if isinstance(safety, dict) else None
+            if safety_status not in {"blocked", "cooldown", "probe"}:
+                safety_status = None
             # A frozen report is immutable in its counters, even if members
             # register afterwards or an administrator forces a refresh.
             frozen = record.get('frozen_stats') if isinstance(record, dict) else None
@@ -525,32 +554,66 @@ class KingshotBot(discord.Client):
                                 'active' if expiry is not None else 'unknown')
             ment = load_report_ment()
             ment_signature = hashlib.sha256(ment.encode("utf-8")).hexdigest()
+            safety_signature = hashlib.sha256(
+                json.dumps({"status": safety_status,
+                            "reason": safety.get("reason", "") if safety_status else "",
+                            "until": safety.get("until", "") if safety_status == "cooldown" else ""},
+                           ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
             if (not force and record.get('signature') == signature
                     and record.get('expiry_signature') == expiry_signature
-                    and record.get('ment_signature') == ment_signature):
+                    and record.get('ment_signature') == ment_signature
+                    and record.get('safety_signature') == safety_signature):
                 return "Report unchanged."
 
             finished = stats['total'] - stats['pending']
-            # Display redemption progress independently of unknown expiry dates.
+            notice = None
             if expired:
                 label = "🔴 만료"
+                color = discord.Color.dark_grey()
+                progress = f"왕국 1850 · 최종 처리 {finished}/{stats['total']}명"
+            elif safety_status == "blocked":
+                label = "⛔ 자동 수령 차단"
+                color = discord.Color.red()
+                progress = f"왕국 1850 · 처리 기록 {finished}/{stats['total']}명"
+                notice = "반복된 API 오류로 자동 수령을 중단했습니다. 관리자는 `/redeemcode`로 수동 재검사할 수 있습니다."
+            elif safety_status == "cooldown":
+                color = discord.Color.orange()
+                progress = f"왕국 1850 · 처리 기록 {finished}/{stats['total']}명"
+                until_text = str(safety.get("until", ""))
+                try:
+                    until = datetime.fromisoformat(until_text)
+                    if until.tzinfo is None:
+                        until = until.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    until = None
+                if until is not None and now >= until:
+                    label = "🟠 재검사 대기"
+                    notice = "보류 시간이 종료되었습니다. 다음 쿠폰 검사에서 제한적으로 재검사합니다."
+                else:
+                    label = "🟠 일시 보류"
+                    notice = "반복된 API 오류로 자동 수령을 일시 중단했습니다. 보류 종료 후 1명만 재검사합니다."
+            elif safety_status == "probe":
+                label = "🟠 재검사 중"
+                color = discord.Color.orange()
+                progress = f"왕국 1850 · 처리 기록 {finished}/{stats['total']}명"
+                notice = "관리자 요청에 따라 1명에게 시험 요청 중입니다."
             elif stats['pending'] == 0 and stats['failed'] == 0:
                 label = "✅ 처리 완료"
+                color = discord.Color.green()
+                progress = f"왕국 1850 · 진행 {finished}/{stats['total']}명 · 5분마다 확인"
             else:
                 label = "🟢 진행 중"
+                color = discord.Color.orange()
+                progress = f"왕국 1850 · 진행 {finished}/{stats['total']}명 · 5분마다 확인"
 
-            # Don't show an update frequency on archived expired reports.
-            progress = (f"왕국 1850 · 최종 처리 {finished}/{stats['total']}명" if expired
-                        else f"왕국 1850 · 진행 {finished}/{stats['total']}명")
-            if not expired:
-                progress += " · 5분마다 확인"
-
+            description = f"{progress}\n\n**상태: {label}**"
+            if notice:
+                description += f"\n\n{notice}"
             embed = discord.Embed(
                 title=f"🍅 DMD Gift Code — {code}",
-                description=f"{progress}\n\n**상태: {label}**",
-                color=(discord.Color.dark_grey() if expired
-                       else discord.Color.green() if stats['pending'] == 0 and stats['failed'] == 0
-                       else discord.Color.orange()),
+                description=description,
+                color=color,
             )
             embed.add_field(name="✅ 성공 응답", value=str(stats['success']), inline=True)
             embed.add_field(name="🔁 이미 수령", value=str(stats['already']), inline=True)
@@ -585,6 +648,7 @@ class KingshotBot(discord.Client):
                 'signature': signature,
                 'expiry_signature': expiry_signature,
                 'ment_signature': ment_signature,
+                'safety_signature': safety_signature,
             }
             self.report_store.save_messages(saved)
             return f"Report posted/updated for {code}."
