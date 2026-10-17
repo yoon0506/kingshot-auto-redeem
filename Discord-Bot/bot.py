@@ -576,7 +576,8 @@ class KingshotBot(discord.Client):
                 label = "⛔ 자동 수령 차단"
                 color = discord.Color.red()
                 progress = f"왕국 1850 · 처리 기록 {finished}/{stats['total']}명"
-                notice = "반복된 API 오류로 자동 수령을 중단했습니다. 관리자는 `/redeemcode`로 수동 재검사할 수 있습니다."
+                notice = "반복된 API 오류로 자동 수령을 중단했습니다.\n"
+"관리자는 `/redeemcode`로 수동 재검사할 수 있습니다."
             elif safety_status == "cooldown":
                 color = discord.Color.orange()
                 progress = f"왕국 1850 · 처리 기록 {finished}/{stats['total']}명"
