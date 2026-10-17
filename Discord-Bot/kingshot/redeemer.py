@@ -824,6 +824,18 @@ class AutoRedeemer:
 
 
 
+        # USER INFO ERROR / 40020 is ambiguous: wrong kingdom OR invalid UID.
+        # Quarantine the UID, never delete it or claim misconduct.
+        if "USER INFO ERROR" in str(result.get("message", "")).upper() or str((result.get("raw") or {}).get("err_code", "")) == "40020":
+            await self.repository.mark_failed(player_id, code, result.get("message", "USER INFO ERROR"))
+            status = await self.repository.quarantine_invalid_uid(player_id, str(result.get("message", "USER INFO ERROR")))
+            await self.repository.log_event("uid_quarantined_for_review", playerId=player_id,
+                                            code=code, reason="USER INFO ERROR", status=status)
+            logger.warning("DMD UID GUARD: player %s disabled for automatic redemption; "
+                           "USER INFO ERROR (kingdom mismatch or invalid UID). "
+                           "Admin must verify and use /reactivate.", player_id)
+            return "failed"
+
         await self.repository.mark_failed(player_id, code, result["message"])
 
         await self.repository.log_event(
