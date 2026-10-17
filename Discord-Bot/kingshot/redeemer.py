@@ -660,22 +660,15 @@ class AutoRedeemer:
             )
             return "failed"
 
+        # A general application-level rejection must not stall everyone else.
+        # Only rate_limited responses retain the global cooldown above.
+        # Non-transient errors (e.g. RECHARGE_MONEY ERROR / USER INFO ERROR)
+        # remain recorded for review instead of hammering the same UID again.
         logger.warning(
-
-            "Redeem failed for player %s, code %s: %s. Waiting %ss before continuing.",
-
-            player_id,
-
-            code,
-
-            result["message"],
-
-            self.config["failure_cooldown_seconds"],
-
+            "Redeem failed for player %s, code %s: %s. "
+            "Continuing with the next player at the normal interval (no 180s global pause).",
+            player_id, code, result.get("message", "Unknown error"),
         )
-
-        await asyncio.sleep(self.config["failure_cooldown_seconds"])
-
         return "failed"
 
 
