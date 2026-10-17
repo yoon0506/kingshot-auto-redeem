@@ -358,6 +358,40 @@ class JsonRepository:
             self._save_json(self.players_path, payload)
             return "changed"
 
+    async def quarantine_invalid_uid(self, player_id: str, reason: str) -> str:
+        """Stop further attempts on an API-rejected UID without deleting history."""
+        async with self._lock:
+            payload = self._load_json(self.players_path, {"schemaVersion": 1, "players": {}})
+            player = payload.get("players", {}).get(str(player_id))
+            if not isinstance(player, dict):
+                return "not_found"
+            if player.get("uidReviewRequired", False):
+                return "unchanged"
+            player["uidReviewRequired"] = True
+            player["uidReviewReason"] = reason[:240]
+            player["uidReviewAt"] = utc_now_iso()
+            player["autoRedeem"] = False
+            player["updatedAt"] = utc_now_iso()
+            self._save_json(self.players_path, payload)
+            return "changed"
+
+    async def clear_uid_quarantine(self, player_id: str) -> str:
+        """Admin-approved reactivation; preserve registration and redemption history."""
+        async with self._lock:
+            payload = self._load_json(self.players_path, {"schemaVersion": 1, "players": {}})
+            player = payload.get("players", {}).get(str(player_id))
+            if not isinstance(player, dict):
+                return "not_found"
+            if not player.get("uidReviewRequired", False):
+                return "unchanged"
+            player["uidReviewRequired"] = False
+            player["uidReviewReason"] = None
+            player["uidReviewAt"] = None
+            player["autoRedeem"] = not player.get("withdrawn", False)
+            player["updatedAt"] = utc_now_iso()
+            self._save_json(self.players_path, payload)
+            return "changed"
+
     async def bulk_remove(self, player_ids: list[str]) -> dict[str, list[str]]:
         """Admin-only caller. Delete players and unlink from their real Discord owners."""
         async with self._lock:
@@ -456,7 +490,7 @@ class JsonRepository:
 
             if player:
 
-                if enabled and player.get("withdrawn", False):
+                if enabled and (player.get("withdrawn", False) or player.get("uidReviewRequired", False)):
                     raise ValueError("Withdrawn player requires admin /reactivate")
                 player["autoRedeem"] = enabled
 
@@ -474,7 +508,7 @@ class JsonRepository:
 
             records = list(players.get("players", {}).values())
 
-            return [player for player in records if player.get("autoRedeem", True) and not player.get("withdrawn", False)]
+            return [player for player in records if player.get("autoRedeem", True) and not player.get("withdrawn", False) and not player.get("uidReviewRequired", False)]
 
 
 
