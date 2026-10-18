@@ -408,6 +408,13 @@ class AutoRedeemer:
         retry_wait = max(60.0, float(self.config.get("same_cycle_timeout_retry_seconds", 60)))
         if timeout_retries:
             logger.info("Starting end-of-cycle timeout retries: %s job(s)", len(timeout_retries))
+        # DMD retries first; within each alliance priority preserve arrival order.
+        retry_players = await self.repository.list_auto_redeem_players()
+        dmd_player_ids = {
+            str(player.get("playerId")) for player in retry_players
+            if self._is_dmd_player(player)
+        }
+        timeout_retries.sort(key=lambda item: 0 if item[0] in dmd_player_ids else 1)
         for index, (player_id, code, failed_at) in enumerate(timeout_retries, start=1):
             if code not in active_codes:
                 logger.info("Skipping timeout retry for %s: code %s no longer active", player_id, code)
@@ -529,20 +536,25 @@ class AutoRedeemer:
 
 
 
+        # Complete DMD jobs before moving to other alliances.
+        dmd_candidates = [job for job in candidates if self._is_dmd_player(job.player)]
+        priority_candidates = dmd_candidates or candidates
         preferred = [
-
-            job
-
-            for job in candidates
-
+            job for job in priority_candidates
             if str(job.player["playerId"]) != str(last_player_id)
-
         ]
-
-        job = random.choice(preferred or candidates)
-
+        job = random.choice(preferred or priority_candidates)
         return job, not preferred and last_player_id is not None, len(candidates), len(players)
 
+
+    @staticmethod
+    def _is_dmd_player(player: dict) -> bool:
+        """Legacy players with no allianceId belong to DMD (ID 0)."""
+        alliance_id = player.get("allianceId", 0)
+        try:
+            return int(alliance_id) == 0
+        except (TypeError, ValueError):
+            return False
 
 
     async def _count_missing_jobs(
