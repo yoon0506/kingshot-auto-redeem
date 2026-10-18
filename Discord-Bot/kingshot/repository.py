@@ -764,7 +764,9 @@ class JsonRepository:
 
             with os.fdopen(fd, "w", encoding="utf-8") as file:
 
-                json.dump(data, file, indent=2, ensure_ascii=False)
+                # Compact JSON avoids expensive pretty-printing on every atomic save.
+                # Keep UTF-8 content, temporary-file write, and os.replace unchanged.
+                file.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
 
             os.replace(tmp_path, path)
 
