@@ -427,6 +427,15 @@ class KingshotBot(discord.Client):
         codes_to_refresh = list(dict.fromkeys([*recent, *posted_codes]))
         successful = True
         for code in codes_to_refresh:
+            # A report is final only after Discord was successfully updated to
+            # the expired state. Do not skip an expired code merely because
+            # codes.json says expired: its message may still be green.
+            record = existing.get(f"{prefix}{code}", {})
+            if (isinstance(record, dict)
+                    and record.get("message_id")
+                    and record.get("expiry_signature") == "expired"
+                    and isinstance(record.get("frozen_stats"), dict)):
+                continue
             result = await self.publish_redeem_report(code)
             if result not in ("Report unchanged.", f"Report posted/updated for {code}."):
                 successful = False
