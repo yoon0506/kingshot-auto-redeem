@@ -412,8 +412,21 @@ class KingshotBot(discord.Client):
         if snapshot == self._report_last_snapshot:
             logger.debug("DMD report: inputs unchanged; aggregation skipped")
             return
+        # Keep monitoring previously posted reports even after a code falls
+        # outside the 48-hour discovery window. This catches late expiry and
+        # code-safety transitions without creating reports for every old code.
+        recent = self.report_store.recent_codes()
+        existing = self.report_store.load_messages()
+        prefix = f"{self.report_channel_id}:"
+        posted_codes = [
+            key[len(prefix):] for key, record in existing.items()
+            if isinstance(key, str) and key.startswith(prefix)
+            and isinstance(record, dict) and record.get("message_id")
+            and key[len(prefix):]
+        ]
+        codes_to_refresh = list(dict.fromkeys([*recent, *posted_codes]))
         successful = True
-        for code in self.report_store.recent_codes():
+        for code in codes_to_refresh:
             result = await self.publish_redeem_report(code)
             if result not in ("Report unchanged.", f"Report posted/updated for {code}."):
                 successful = False
