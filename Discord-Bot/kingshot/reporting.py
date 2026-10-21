@@ -72,6 +72,15 @@ class ReportStore:
         except (FileNotFoundError, ValueError, OSError, TypeError):
             return None
 
+    def detected_max_uses_at(self, code: str) -> datetime | None:
+        """When Kingshot confirmed the code exhausted its global use limit."""
+        try:
+            codes = json.loads(self.repo.codes_path.read_text(encoding='utf-8'))
+            entry = codes.get('knownCodes', {}).get(str(code), {})
+            return _utc(entry.get('maxUsesReachedAt')) if isinstance(entry, dict) else None
+        except (FileNotFoundError, ValueError, OSError, TypeError):
+            return None
+
     def set_expiry(self, code: str, expires: datetime) -> None:
         """Atomically store UTC expiration without changing redemption history."""
         try:

@@ -529,12 +529,16 @@ class KingshotBot(discord.Client):
             return "DMD_REPORT_CHANNEL_ID is not configured."
         expiry = self.report_store.expiry_for(code)
         detected_expiry = self.report_store.detected_expired_at(code)
+        detected_max_uses = self.report_store.detected_max_uses_at(code)
         now = datetime.now(timezone.utc)
         async with self._report_lock:
             saved = self.report_store.load_messages()
             key = f"{self.report_channel_id}:{code}"
             record = saved.get(key, {})
-            expiry_cutoff = detected_expiry or (expiry if expiry and now >= expiry else None)
+            # Both expiry and global use-limit exhaustion are terminal for
+            # automatic redemption. Keep the separate cause in codes.json.
+            expiry_cutoff = (detected_expiry or detected_max_uses
+                             or (expiry if expiry and now >= expiry else None))
             expired = expiry_cutoff is not None
             safety = self._code_safety_state(code) if not expired else {}
             safety_status = safety.get("status") if isinstance(safety, dict) else None
@@ -594,6 +598,8 @@ class KingshotBot(discord.Client):
                 label = "🔴 만료"
                 color = discord.Color.dark_grey()
                 progress = f"왕국 1850 · 최종 처리 {finished}/{stats['total']}명"
+                if detected_max_uses is not None:
+                    notice = "교환 횟수 초과로 더 이상 수령할 수 없습니다."
             elif safety_status == "blocked":
                 label = "⛔ 자동 수령 차단"
                 color = discord.Color.red()
