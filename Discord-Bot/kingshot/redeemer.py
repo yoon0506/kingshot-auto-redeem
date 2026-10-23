@@ -599,9 +599,8 @@ class AutoRedeemer:
                     if last_failed.tzinfo is None:
                         last_failed = last_failed.replace(tzinfo=timezone.utc)
                     attempts = max(1, int(failure.get("attempts", 1)))
-                    base = max(60, int(self.config.get("timeout_retry_cooldown_seconds", 600)))
-                    cap = max(base, int(self.config.get("timeout_retry_max_cooldown_seconds", 3600)))
-                    cooldown = min(cap, base * (2 ** min(attempts - 1, 10)))
+                    # Timeout-only retry cooldown: 5m, 7m, 10m, then 15m maximum.
+                    cooldown = (300, 420, 600, 900)[min(attempts, 4) - 1]
                     if (datetime.now(timezone.utc) - last_failed).total_seconds() < cooldown:
                         continue
                 except (TypeError, ValueError, OverflowError):
